@@ -1014,7 +1014,8 @@ def main(argv):
     fetched_pricing = load_fetched_pricing(default_pricing_path())
     config_pricing = cfg.get("pricing") or {}
     pricing_overrides = sorted(config_pricing)
-    pricing_builtin_only = sorted(k for k in PRICING if fetched_pricing and k not in fetched_pricing["models"])
+    pricing_builtin_only = sorted(k for k in PRICING
+                                  if fetched_pricing and k not in fetched_pricing["models"] and k not in config_pricing)
     pricing = {
         **PRICING,
         **(fetched_pricing["models"] if fetched_pricing else {}),
