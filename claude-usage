@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""Aggregate Claude Code token usage across machines.
+
+Claude Code writes one JSONL transcript per session under ~/.claude/projects.
+Every assistant record in there carries the model and the API usage counters
+of the response it belongs to. This tool reads those files on this machine and
+on every SSH host in its config, counts each API response once, and prints
+tokens by type, an estimated cost at Anthropic API list prices, and the share
+per model and per machine.
+
+Remote hosts need nothing installed except python3: the tool sends this file
+over SSH and runs it there as `python3 - --collect`.
+
+Config (optional): ~/.config/claude-usage/config.json
+  {
+    "hosts": [
+      "tobi.coder",
+      {"ssh": "other-box", "name": "other", "projects_dir": "~/.claude/projects", "python": "python3"}
+    ],
+    "ssh_options": ["-o", "BatchMode=yes", "-o", "ConnectTimeout=20"],
+    "timeout": 120,
+    "pricing": {"claude-some-model": [5.0, 25.0, 0.5]}
+  }
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import platform
+import re
+import shlex
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from functools import reduce
+from itertools import groupby
+
+CONFIG_PATH = os.path.expanduser("~/.config/claude-usage/config.json")
+DEFAULT_PROJECTS_DIR = "~/.claude/projects"
+DEFAULT_SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=20"]
+DEFAULT_TIMEOUT = 120
+
+# USD per million tokens: (input, output, cache read).
+# Cache writes are priced off the input rate: 1.25x for the 5-minute TTL,
+# 2x for the 1-hour TTL. Anthropic API list prices as of 2026-09.
+PRICING = {
+    "claude-fable-5-1": (10.0, 50.0, 0.25),
+    "claude-mythos-5-1": (10.0, 50.0, 0.25),
+    "claude-fable-5": (10.0, 50.0, 1.0),
+    "claude-mythos-5": (10.0, 50.0, 1.0),
+    "claude-opus-5": (5.0, 25.0, 0.5),
+    "claude-opus-4-8": (5.0, 25.0, 0.5),
+    "claude-opus-4-7": (5.0, 25.0, 0.5),
+    "claude-opus-4-6": (5.0, 25.0, 0.5),
+    "claude-opus-4-5": (5.0, 25.0, 0.5),
+    "claude-opus-4-1": (15.0, 75.0, 1.5),
+    "claude-opus-4-0": (15.0, 75.0, 1.5),
+    "claude-opus-4": (15.0, 75.0, 1.5),
+    "claude-sonnet-5": (2.0, 10.0, 0.2),
+    "claude-sonnet-4-6": (3.0, 15.0, 0.3),
+    "claude-sonnet-4-5": (3.0, 15.0, 0.3),
+    "claude-sonnet-4-0": (3.0, 15.0, 0.3),
+    "claude-sonnet-4": (3.0, 15.0, 0.3),
+    "claude-haiku-4-5": (1.0, 5.0, 0.1),
+}
+CACHE_WRITE_5M = 1.25
+CACHE_WRITE_1H = 2.0
+FAST_MODE_MULTIPLIER = 2.0  # speed="fast" doubles every rate on these models
+FAST_MODE_MODELS = {"claude-opus-5", "claude-opus-4-8"}
+
+TOKEN_KEYS = ("i", "w5", "w1", "r", "o")
+TOKEN_LABELS = {
+    "i": "Input (uncached)",
+    "w5": "Cache write, 5 min TTL",
+    "w1": "Cache write, 1 h TTL",
+    "r": "Cache read",
+    "o": "Output",
+}
+
+
+# --------------------------------------------------------------------------
+# Collecting: one machine, one row per API response
+# --------------------------------------------------------------------------
+
+def parse_line(line):
+    """One transcript line -> usage row, or None if it is not a billable response."""
+    try:
+        d = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(d, dict) or d.get("type") != "assistant":
+        return None
+    m = d.get("message") or {}
+    u = m.get("usage") or {}
+    model = m.get("model") or ""
+    # "<synthetic>" is Claude Code's own placeholder for rate-limit and error
+    # messages; it carries zero usage and no model.
+    if not u or not model or model.startswith("<"):
+        return None
+    w_total = u.get("cache_creation_input_tokens") or 0
+    w1 = (u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0
+    row = {
+        "id": m.get("id") or d.get("uuid") or "",
+        "rq": d.get("requestId") or "",
+        "t": d.get("timestamp") or "",
+        "m": model,
+        "i": u.get("input_tokens") or 0,
+        "o": u.get("output_tokens") or 0,
+        "w5": max(w_total - w1, 0),
+        "w1": w1,
+        "r": u.get("cache_read_input_tokens") or 0,
+        "f": 1 if u.get("speed") == "fast" else 0,
+        "e": d.get("entrypoint") or "unknown",
+        "s": d.get("sessionId") or "",
+        "p": d.get("cwd") or "",
+    }
+    return row if any(row[k] for k in TOKEN_KEYS) else None
+
+
+def rows_of(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return [r for r in map(parse_line, fh) if r is not None]
+
+
+def dedup(rows):
+    """One row per API response.
+
+    Claude Code writes one record per content block of a streamed response,
+    all with the same message id and request id. Only the last one carries
+    the final output token count, so the record with the largest output
+    count wins. The same rule also folds a response that shows up on two
+    machines (a session copied between them) into one.
+    """
+    def keep_final(acc, r):
+        k = (r["id"], r["rq"])
+        if k not in acc or r["o"] > acc[k]["o"]:
+            acc[k] = r
+        return acc
+    return list(reduce(keep_final, rows, {}).values())
+
+
+def scan(projects_dir):
+    root = os.path.expanduser(projects_dir)
+    files = sorted(glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True))
+    rows = dedup(r for f in files for r in rows_of(f))
+    return rows, {"files": len(files), "projects_dir": root, "exists": os.path.isdir(root)}
+
+
+def run_collect(args):
+    t0 = time.time()
+    rows, meta = scan(args.projects_dir)
+    sys.stdout.writelines(json.dumps(r, separators=(",", ":")) + "\n" for r in rows)
+    summary = {**meta, "node": platform.node(), "python": platform.python_version(),
+               "seconds": round(time.time() - t0, 2)}
+    sys.stdout.write(json.dumps({"meta": summary}) + "\n")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Gathering: this machine in-process, every other one over SSH
+# --------------------------------------------------------------------------
+
+def machine(name, rows, meta, error=None):
+    return {"name": name, "rows": [{**r, "mach": name} for r in rows], "meta": meta, "error": error}
+
+
+def local_machine(projects_dir):
+    t0 = time.time()
+    rows, meta = scan(projects_dir)
+    return machine(platform.node(), rows, {**meta, "node": platform.node(), "python": platform.python_version(),
+                                           "seconds": round(time.time() - t0, 2)})
+
+
+def normalize_host(h):
+    spec = {"ssh": h} if isinstance(h, str) else dict(h)
+    if not spec.get("ssh"):
+        raise SystemExit("config: every host needs an \"ssh\" target: %r" % (h,))
+    return {
+        "name": spec.get("name") or spec["ssh"],
+        "ssh": spec["ssh"],
+        "python": spec.get("python") or "python3",
+        "projects_dir": spec.get("projects_dir"),
+    }
+
+
+def parse_json_line(line):
+    try:
+        return json.loads(line)
+    except ValueError:
+        return None
+
+
+def parse_collect_output(name, text):
+    objs = [o for o in map(parse_json_line, text.splitlines()) if isinstance(o, dict)]
+    metas = [o["meta"] for o in objs if "meta" in o]
+    rows = [o for o in objs if "meta" not in o]
+    if not metas:
+        return machine(name, [], {}, error="collector produced no summary line (stdout: %d lines)" % len(text.splitlines()))
+    return machine(name, rows, metas[-1])
+
+
+def fetch_remote(host, source, ssh_options, timeout):
+    remote_cmd = " ".join(
+        [host["python"], "-", "--collect"]
+        + (["--projects-dir", shlex.quote(host["projects_dir"])] if host["projects_dir"] else [])
+    )
+    cmd = ["ssh", *ssh_options, host["ssh"], remote_cmd]
+    try:
+        p = subprocess.run(cmd, input=source, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return machine(host["name"], [], {}, error="timed out after %ss" % timeout)
+    except OSError as e:
+        return machine(host["name"], [], {}, error=str(e))
+    if p.returncode != 0:
+        tail = p.stderr.strip().splitlines()
+        return machine(host["name"], [], {}, error=tail[-1] if tail else "ssh exited with %d" % p.returncode)
+    return parse_collect_output(host["name"], p.stdout)
+
+
+def read_self():
+    with open(os.path.realpath(__file__), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def load_config(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        try:
+            return json.load(fh)
+        except ValueError as e:
+            raise SystemExit("config %s is not valid JSON: %s" % (path, e))
+
+
+# --------------------------------------------------------------------------
+# Pricing and summaries
+# --------------------------------------------------------------------------
+
+def price_key(model, pricing):
+    base = re.sub(r"-\d{8}$", "", model)
+    if base in pricing:
+        return base
+    return next((k for k in sorted(pricing, key=len, reverse=True) if base.startswith(k + "-")), None)
+
+
+def row_cost(r, pricing):
+    key = price_key(r["m"], pricing)
+    if key is None:
+        return None
+    inp, out, read = pricing[key]
+    mult = FAST_MODE_MULTIPLIER if r["f"] and key in FAST_MODE_MODELS else 1.0
+    raw = (r["i"] * inp + r["o"] * out + r["r"] * read
+           + r["w5"] * inp * CACHE_WRITE_5M + r["w1"] * inp * CACHE_WRITE_1H)
+    return mult * raw / 1e6
+
+
+def empty_summary():
+    return {**{k: 0 for k in TOKEN_KEYS}, "calls": 0, "cost": 0.0, "unpriced": 0}
+
+
+def summarize(rows, pricing):
+    def add(acc, r):
+        c = row_cost(r, pricing)
+        return {
+            **acc,
+            **{k: acc[k] + r[k] for k in TOKEN_KEYS},
+            "calls": acc["calls"] + 1,
+            "cost": acc["cost"] + (c if c is not None else 0.0),
+            "unpriced": acc["unpriced"] + (0 if c is not None else sum(r[k] for k in TOKEN_KEYS)),
+        }
+    return reduce(add, rows, empty_summary())
+
+
+def total_tokens(s):
+    return sum(s[k] for k in TOKEN_KEYS)
+
+
+def group(rows, keyfn, pricing):
+    return {k: summarize(list(g), pricing) for k, g in groupby(sorted(rows, key=keyfn), key=keyfn)}
+
+
+def parse_ts(t):
+    try:
+        return datetime.strptime(t[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def local_bucket(fmt):
+    def key(r):
+        dt = parse_ts(r["t"])
+        return dt.astimezone().strftime(fmt) if dt else "unknown"
+    return key
+
+
+def model_label(r):
+    return r["m"] + (" (fast)" if r["f"] else "")
+
+
+GROUPINGS = {
+    "day": ("Day", local_bucket("%Y-%m-%d")),
+    "week": ("Week", local_bucket("%G-W%V")),
+    "month": ("Month", local_bucket("%Y-%m")),
+    "entrypoint": ("Entrypoint", lambda r: r["e"]),
+    "project": ("Project (cwd)", lambda r: r["p"] or "unknown"),
+}
+
+
+# --------------------------------------------------------------------------
+# Period selection
+# --------------------------------------------------------------------------
+
+def parse_date(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        raise SystemExit("dates must be YYYY-MM-DD, got %r" % s)
+
+
+def last_delta(spec):
+    m = re.fullmatch(r"(\d+)([dwm])", spec or "")
+    if not m:
+        raise SystemExit("--last expects a number and d, w or m, e.g. 7d, 4w, 3m")
+    return timedelta(days=int(m.group(1)) * {"d": 1, "w": 7, "m": 30}[m.group(2)])
+
+
+def period_bounds(args):
+    """(since, until) as naive local datetimes; until is exclusive."""
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    since = parse_date(args.since) if args.since else (today - last_delta(args.last) if args.last else None)
+    until = parse_date(args.until) + timedelta(days=1) if args.until else None
+    return since, until
+
+
+def to_utc_iso(local_naive):
+    return local_naive.astimezone().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") if local_naive else None
+
+
+def in_period(r, since_s, until_s):
+    t = r["t"][:19]
+    return (since_s is None or t >= since_s) and (until_s is None or t < until_s)
+
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+
+def fmt_tok(n, exact):
+    if exact or n < 1000:
+        return "{:,}".format(n)
+    return next(("{:.1f}{}".format(n / div, suf) for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "k")) if n >= div), str(n))
+
+
+def fmt_usd(c):
+    return "${:,.2f}".format(c)
+
+
+def fmt_pct(part, whole):
+    return "{:.1f}%".format(100.0 * part / whole) if whole else "-"
+
+
+def render_table(headers, rows, indent="  "):
+    if not rows:
+        return indent + "(nothing)"
+    widths = [max(len(str(c)) for c in col) for col in zip(headers, *rows)]
+
+    def line(cells):
+        return indent + "  ".join(
+            str(c).ljust(w) if i == 0 else str(c).rjust(w) for i, (c, w) in enumerate(zip(cells, widths))
+        ).rstrip()
+    return "\n".join([line(headers), indent + "  ".join("-" * w for w in widths)] + [line(r) for r in rows])
+
+
+def usage_row(label, s, exact, grand=None):
+    base = [label, "{:,}".format(s["calls"]), fmt_tok(s["i"], exact), fmt_tok(s["w5"] + s["w1"], exact),
+            fmt_tok(s["r"], exact), fmt_tok(s["o"], exact), fmt_tok(total_tokens(s), exact), fmt_usd(s["cost"])]
+    share = [fmt_pct(total_tokens(s), total_tokens(grand)), fmt_pct(s["cost"], grand["cost"])] if grand else []
+    return base + share
+
+
+USAGE_HEADERS = ["Calls", "Input", "Cache write", "Cache read", "Output", "Total", "Cost"]
+SHARE_HEADERS = ["Tokens %", "Cost %"]
+
+
+def usage_table(first_header, groups, exact, grand=None, order=None, limit=None):
+    keys = order(groups) if order else sorted(groups)
+    keys = keys[:limit] if limit else keys
+    headers = [first_header] + USAGE_HEADERS + (SHARE_HEADERS if grand else [])
+    return render_table(headers, [usage_row(k, groups[k], exact, grand) for k in keys])
+
+
+def by_cost_desc(groups):
+    return sorted(groups, key=lambda k: (-groups[k]["cost"], -total_tokens(groups[k]), k))
+
+
+def session_table(rows, pricing, exact, top):
+    def key(r):
+        return (r["mach"], r["s"])
+    groups = group(rows, key, pricing)
+    firsts = {k: min(r["t"] for r in g) for k, g in groupby(sorted(rows, key=key), key=key)}
+    cwds = {k: next(iter(g))["p"] for k, g in groupby(sorted(rows, key=key), key=key)}
+    keys = by_cost_desc(groups)[:top]
+    headers = ["Session", "Machine", "Project", "First seen", "Calls", "Total", "Cost"]
+    body = [[k[1][:8] or "?", k[0], os.path.basename(cwds[k].rstrip("/")) or cwds[k] or "?",
+             local_bucket("%Y-%m-%d")({"t": firsts[k]}), "{:,}".format(groups[k]["calls"]),
+             fmt_tok(total_tokens(groups[k]), exact), fmt_usd(groups[k]["cost"])] for k in keys]
+    return render_table(headers, body)
+
+
+def machine_lines(machines):
+    def line(m):
+        if m["error"]:
+            return "  {:<14} FAILED: {}".format(m["name"], m["error"])
+        meta = m["meta"]
+        node = meta.get("node")
+        extra = "  ({})".format(node) if node and node != m["name"] else ""
+        missing = "  [projects dir missing: {}]".format(meta.get("projects_dir")) if meta.get("exists") is False else ""
+        return "  {:<14} {:>6,} API calls  {:>4} files  {:>5}s{}{}".format(
+            m["name"], len(m["rows"]), meta.get("files", 0), meta.get("seconds", "?"), extra, missing)
+    return [line(m) for m in machines]
+
+
+def period_text(selected, since, until):
+    if since or until:
+        return "{} to {}".format(since.strftime("%Y-%m-%d") if since else "start",
+                                 (until - timedelta(days=1)).strftime("%Y-%m-%d") if until else "today")
+    if not selected:
+        return "no data"
+    day = local_bucket("%Y-%m-%d")
+    stamps = sorted(day(r) for r in selected)
+    return "{} to {} (all data)".format(stamps[0], stamps[-1])
+
+
+def render_report(machines, selected, cross_dupes, since, until, pricing, args):
+    grand = summarize(selected, pricing)
+    unpriced_models = sorted({r["m"] for r in selected if price_key(r["m"], pricing) is None})
+    out = ["Claude Code usage  ·  {}  ·  {} machine{}".format(
+        period_text(selected, since, until), len(machines), "" if len(machines) == 1 else "s")]
+    out += machine_lines(machines)
+    if cross_dupes:
+        out.append("  {:,} responses were present on more than one machine and are counted once.".format(cross_dupes))
+    out.append("  Times and day buckets use this machine's local timezone.")
+    out.append("")
+    out.append("Tokens")
+    tok_rows = [[TOKEN_LABELS[k], fmt_tok(grand[k], args.exact), fmt_pct(grand[k], total_tokens(grand))] for k in TOKEN_KEYS]
+    tok_rows.append(["Total", fmt_tok(total_tokens(grand), args.exact), "100%" if total_tokens(grand) else "-"])
+    out.append(render_table(["Type", "Tokens", "Share"], tok_rows))
+    out.append("")
+    out.append("  API calls: {:,}".format(grand["calls"]))
+    out.append("  Estimated cost at Anthropic API list prices: {}".format(fmt_usd(grand["cost"])))
+    out.append("  (what these tokens would cost pay-as-you-go; on a subscription this is not the bill)")
+    if unpriced_models:
+        out.append("  WARNING: no pricing for {} -> {} tokens excluded from the cost.".format(
+            ", ".join(unpriced_models), fmt_tok(grand["unpriced"], args.exact)))
+    out.append("")
+    out.append("By model")
+    out.append(usage_table("Model", group(selected, model_label, pricing), args.exact, grand, by_cost_desc))
+    out.append("")
+    out.append("By machine")
+    out.append(usage_table("Machine", group(selected, lambda r: r["mach"], pricing), args.exact, grand, by_cost_desc))
+    for name in args.by:
+        out.append("")
+        if name == "session":
+            out.append("Top {} sessions by cost".format(args.top))
+            out.append(session_table(selected, pricing, args.exact, args.top))
+        else:
+            header, keyfn = GROUPINGS[name]
+            time_based = name in ("day", "week", "month")
+            out.append("By {}".format(name))
+            out.append(usage_table(header, group(selected, keyfn, pricing), args.exact,
+                                   None if time_based else grand,
+                                   None if time_based else by_cost_desc,
+                                   None if time_based else args.top))
+    return "\n".join(out)
+
+
+def summary_json(s):
+    return {**{TOKEN_LABELS[k]: s[k] for k in TOKEN_KEYS}, "total": total_tokens(s),
+            "calls": s["calls"], "cost_usd": round(s["cost"], 4), "unpriced_tokens": s["unpriced"]}
+
+
+def render_json(machines, selected, cross_dupes, since, until, pricing, args):
+    grand = summarize(selected, pricing)
+    doc = {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "period": {"since": since.strftime("%Y-%m-%d") if since else None,
+                   "until_inclusive": (until - timedelta(days=1)).strftime("%Y-%m-%d") if until else None},
+        "machines": [{"name": m["name"], "calls": len(m["rows"]), "error": m["error"],
+                      **{k: m["meta"].get(k) for k in ("files", "seconds", "node", "projects_dir", "python")}} for m in machines],
+        "cross_machine_duplicates": cross_dupes,
+        "totals": summary_json(grand),
+        "unpriced_models": sorted({r["m"] for r in selected if price_key(r["m"], pricing) is None}),
+        "by_model": {k: summary_json(v) for k, v in group(selected, model_label, pricing).items()},
+        "by_machine": {k: summary_json(v) for k, v in group(selected, lambda r: r["mach"], pricing).items()},
+        "by": {name: {("/".join(k) if isinstance(k, tuple) else k): summary_json(v) for k, v in
+                      (group(selected, lambda r: (r["mach"], r["s"]), pricing) if name == "session"
+                       else group(selected, GROUPINGS[name][1], pricing)).items()} for name in args.by},
+    }
+    return json.dumps(doc, indent=2)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="claude-usage",
+        description="Aggregate Claude Code token usage from this machine and every SSH host in the config.",
+        epilog="Config file: %s (see the module docstring for its shape)." % CONFIG_PATH)
+    p.add_argument("--since", metavar="YYYY-MM-DD", help="first day to include (local time)")
+    p.add_argument("--until", metavar="YYYY-MM-DD", help="last day to include (local time, inclusive)")
+    p.add_argument("--last", metavar="N{d,w,m}", help="only the last N days/weeks/months (m = 30 days), e.g. 7d")
+    p.add_argument("--by", action="append", default=[], choices=sorted(GROUPINGS) + ["session"],
+                   help="add a breakdown; repeatable")
+    p.add_argument("--top", type=int, default=15, help="rows to show for project/session/entrypoint breakdowns")
+    p.add_argument("--host", action="append", metavar="SSH_HOST",
+                   help="SSH host to include; repeatable; replaces the config's host list")
+    p.add_argument("--no-local", action="store_true", help="skip this machine")
+    p.add_argument("--no-remote", action="store_true", help="skip every SSH host")
+    p.add_argument("--config", default=CONFIG_PATH, help="config file (default: %(default)s)")
+    p.add_argument("--projects-dir", default=DEFAULT_PROJECTS_DIR,
+                   help="transcript folder on this machine (default: %(default)s)")
+    p.add_argument("--timeout", type=int, help="seconds to wait per SSH host (default: config or %d)" % DEFAULT_TIMEOUT)
+    p.add_argument("--exact", action="store_true", help="print exact token counts instead of k/M")
+    p.add_argument("--json", action="store_true", help="print JSON instead of the text report")
+    p.add_argument("--collect", action="store_true", help=argparse.SUPPRESS)
+    return p
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+    if args.collect:
+        return run_collect(args)
+    cfg = load_config(args.config)
+    pricing = {**PRICING, **{k: tuple(v) for k, v in (cfg.get("pricing") or {}).items()}}
+    hosts = [] if args.no_remote else [normalize_host(h) for h in (args.host or cfg.get("hosts") or [])]
+    ssh_options = cfg.get("ssh_options") or DEFAULT_SSH_OPTIONS
+    timeout = args.timeout or cfg.get("timeout") or DEFAULT_TIMEOUT
+    if args.no_local and not hosts:
+        raise SystemExit("nothing to scan: --no-local given and no SSH hosts configured")
+    source = read_self() if hosts else ""
+    with ThreadPoolExecutor(max_workers=len(hosts) + 1) as ex:
+        local = [] if args.no_local else [ex.submit(local_machine, args.projects_dir)]
+        remote = [ex.submit(fetch_remote, h, source, ssh_options, timeout) for h in hosts]
+        machines = [f.result() for f in local + remote]
+    all_rows = [r for m in machines for r in m["rows"]]
+    rows = dedup(all_rows)
+    since, until = period_bounds(args)
+    since_s, until_s = to_utc_iso(since), to_utc_iso(until)
+    selected = [r for r in rows if in_period(r, since_s, until_s)]
+    render = render_json if args.json else render_report
+    print(render(machines, selected, len(all_rows) - len(rows), since, until, pricing, args))
+    failed = [m["name"] for m in machines if m["error"]]
+    if failed:
+        sys.stdout.flush()
+        print("\n{} machine{} could not be read: {}. Totals above are incomplete.".format(
+            len(failed), "" if len(failed) == 1 else "s", ", ".join(failed)), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
