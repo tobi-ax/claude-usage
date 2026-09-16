@@ -325,7 +325,12 @@ def default_pricing_path():
 
 
 def is_finite_number(x):
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:  # an int too large for a float is not a usable rate either
+        return False
 
 
 def is_rate_dict(v):
@@ -826,17 +831,25 @@ def override_note(overrides):
     return ", {} model{} overridden in config".format(len(overrides), "" if len(overrides) == 1 else "s")
 
 
-def pricing_source_line(fetched, overrides):
+def builtin_only_note(builtin_only):
+    if not builtin_only:
+        return ""
+    return ", {} model{} only in the built-in table".format(len(builtin_only), "" if len(builtin_only) == 1 else "s")
+
+
+def pricing_source_line(fetched, overrides, builtin_only):
     note = override_note(overrides)
     if fetched:
         host = urllib.parse.urlparse(fetched["source"]).netloc or fetched["source"]
-        return "  Prices: fetched {} from {}{}".format(fetched["fetched_at"][:10], host, note)
+        return "  Prices: fetched {} from {}{}{}".format(
+            fetched["fetched_at"][:10], host, builtin_only_note(builtin_only), note)
     return "  Prices: built-in table ({}){}; run 'claude-usage update' for current ones".format(
         BUILTIN_PRICING_AS_OF, note)
 
 
-def pricing_source_json(fetched, overrides):
-    base = ({"source": "fetched", "fetched_at": fetched["fetched_at"], "url": fetched["source"]} if fetched
+def pricing_source_json(fetched, overrides, builtin_only):
+    base = ({"source": "fetched", "fetched_at": fetched["fetched_at"], "url": fetched["source"],
+             "builtin_only": sorted(builtin_only)} if fetched
             else {"source": "built-in", "as_of": BUILTIN_PRICING_AS_OF})
     return {**base, "config_overrides": sorted(overrides)}
 
@@ -872,7 +885,7 @@ def render_report(ctx):
         period_text(selected, ctx["since"], ctx["until"]), len(machines), "" if len(machines) == 1 else "s")]
     out += machine_lines(machines)
     out.append(warehouse_line(ctx["warehouse"]))
-    out.append(pricing_source_line(ctx["fetched_pricing"], ctx["pricing_overrides"]))
+    out.append(pricing_source_line(ctx["fetched_pricing"], ctx["pricing_overrides"], ctx["pricing_builtin_only"]))
     if ctx["cross_dupes"]:
         out.append("  {:,} responses were present on more than one machine and are counted once.".format(ctx["cross_dupes"]))
     out += [l for l in [imported_line(selected, args.exact)] if l]
@@ -927,7 +940,7 @@ def render_json(ctx):
         "machines": [{"name": m["name"], "calls": len(m["rows"]), "error": m["error"],
                       **{k: m["meta"].get(k) for k in ("files", "seconds", "node", "projects_dir", "python")}} for m in machines],
         "warehouse": ctx["warehouse"],
-        "pricing": pricing_source_json(ctx["fetched_pricing"], ctx["pricing_overrides"]),
+        "pricing": pricing_source_json(ctx["fetched_pricing"], ctx["pricing_overrides"], ctx["pricing_builtin_only"]),
         "cross_machine_duplicates": ctx["cross_dupes"],
         "approximate_rows": sum(1 for r in selected if is_imported(r)),
         "totals": summary_json(grand),
@@ -1001,6 +1014,7 @@ def main(argv):
     fetched_pricing = load_fetched_pricing(default_pricing_path())
     config_pricing = cfg.get("pricing") or {}
     pricing_overrides = sorted(config_pricing)
+    pricing_builtin_only = sorted(k for k in PRICING if fetched_pricing and k not in fetched_pricing["models"])
     pricing = {
         **PRICING,
         **(fetched_pricing["models"] if fetched_pricing else {}),
@@ -1031,6 +1045,7 @@ def main(argv):
         "selected": [r for r in rows if in_period(r, since_s, until_s)],
         "cross_dupes": len(all_rows) - len(live), "warehouse": warehouse,
         "fetched_pricing": fetched_pricing, "pricing_overrides": pricing_overrides,
+        "pricing_builtin_only": pricing_builtin_only,
     }
     print((render_json if args.json else render_report)(ctx))
     failed = [m["name"] for m in machines if m["error"]]
