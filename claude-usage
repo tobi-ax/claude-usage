@@ -26,6 +26,12 @@ Config (optional): ~/.config/claude-usage/config.json
     "warehouse": "~/.local/share/claude-usage/rows.jsonl",
     "pricing": {"claude-some-model": [5.0, 25.0, 0.5]}
   }
+
+Cost estimates use a built-in price table. Run `claude-usage update` to fetch
+current prices from Anthropic's pricing page into
+~/.local/share/claude-usage/pricing.json; a report then prefers that file
+over the built-in table, and a "pricing" entry in the config above still
+overrides both.
 """
 from __future__ import annotations
 
@@ -39,10 +45,13 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import reduce
-from itertools import groupby
+from itertools import groupby, takewhile
 
 CONFIG_PATH = os.path.expanduser("~/.config/claude-usage/config.json")
 DEFAULT_PROJECTS_DIR = "~/.claude/projects"
@@ -51,31 +60,45 @@ DEFAULT_SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=20"]
 DEFAULT_TIMEOUT = 120
 IMPORTED_ENTRYPOINT = "stats-cache"
 
-# USD per million tokens: (input, output, cache read).
-# Cache writes are priced off the input rate: 1.25x for the 5-minute TTL,
-# 2x for the 1-hour TTL. Anthropic API list prices as of 2026-09.
+# USD per million tokens, per model: input, output, cache read, and the two
+# cache-write rates (5-minute and 1-hour TTL). Anthropic API list prices as
+# of BUILTIN_PRICING_AS_OF; `claude-usage update` fetches current rates into
+# a pricing.json that a report prefers over this table (see price_key()).
+BUILTIN_PRICING_AS_OF = "2026-09"
+CACHE_WRITE_5M = 1.25  # multiplier of the input rate, 5-minute cache write TTL
+CACHE_WRITE_1H = 2.0  # multiplier of the input rate, 1-hour cache write TTL
+
+
+def derive_rates(input_rate, output_rate, cache_read_rate):
+    return {
+        "input": input_rate,
+        "cache_write_5m": input_rate * CACHE_WRITE_5M,
+        "cache_write_1h": input_rate * CACHE_WRITE_1H,
+        "cache_read": cache_read_rate,
+        "output": output_rate,
+    }
+
+
 PRICING = {
-    "claude-fable-5-1": (10.0, 50.0, 0.25),
-    "claude-mythos-5-1": (10.0, 50.0, 0.25),
-    "claude-fable-5": (10.0, 50.0, 1.0),
-    "claude-mythos-5": (10.0, 50.0, 1.0),
-    "claude-opus-5": (5.0, 25.0, 0.5),
-    "claude-opus-4-8": (5.0, 25.0, 0.5),
-    "claude-opus-4-7": (5.0, 25.0, 0.5),
-    "claude-opus-4-6": (5.0, 25.0, 0.5),
-    "claude-opus-4-5": (5.0, 25.0, 0.5),
-    "claude-opus-4-1": (15.0, 75.0, 1.5),
-    "claude-opus-4-0": (15.0, 75.0, 1.5),
-    "claude-opus-4": (15.0, 75.0, 1.5),
-    "claude-sonnet-5": (2.0, 10.0, 0.2),
-    "claude-sonnet-4-6": (3.0, 15.0, 0.3),
-    "claude-sonnet-4-5": (3.0, 15.0, 0.3),
-    "claude-sonnet-4-0": (3.0, 15.0, 0.3),
-    "claude-sonnet-4": (3.0, 15.0, 0.3),
-    "claude-haiku-4-5": (1.0, 5.0, 0.1),
+    "claude-fable-5-1": derive_rates(10.0, 50.0, 0.25),
+    "claude-mythos-5-1": derive_rates(10.0, 50.0, 0.25),
+    "claude-fable-5": derive_rates(10.0, 50.0, 1.0),
+    "claude-mythos-5": derive_rates(10.0, 50.0, 1.0),
+    "claude-opus-5": derive_rates(5.0, 25.0, 0.5),
+    "claude-opus-4-8": derive_rates(5.0, 25.0, 0.5),
+    "claude-opus-4-7": derive_rates(5.0, 25.0, 0.5),
+    "claude-opus-4-6": derive_rates(5.0, 25.0, 0.5),
+    "claude-opus-4-5": derive_rates(5.0, 25.0, 0.5),
+    "claude-opus-4-1": derive_rates(15.0, 75.0, 1.5),
+    "claude-opus-4-0": derive_rates(15.0, 75.0, 1.5),
+    "claude-opus-4": derive_rates(15.0, 75.0, 1.5),
+    "claude-sonnet-5": derive_rates(2.0, 10.0, 0.2),
+    "claude-sonnet-4-6": derive_rates(3.0, 15.0, 0.3),
+    "claude-sonnet-4-5": derive_rates(3.0, 15.0, 0.3),
+    "claude-sonnet-4-0": derive_rates(3.0, 15.0, 0.3),
+    "claude-sonnet-4": derive_rates(3.0, 15.0, 0.3),
+    "claude-haiku-4-5": derive_rates(1.0, 5.0, 0.1),
 }
-CACHE_WRITE_5M = 1.25
-CACHE_WRITE_1H = 2.0
 FAST_MODE_MULTIPLIER = 2.0  # speed="fast" doubles every rate on these models
 FAST_MODE_MODELS = {"claude-opus-5", "claude-opus-4-8"}
 
@@ -288,6 +311,139 @@ def display_path(path):
 
 
 # --------------------------------------------------------------------------
+# Pricing file: current model prices fetched from Anthropic
+# --------------------------------------------------------------------------
+
+PRICING_SOURCE_URL = "https://platform.claude.com/docs/en/about-claude/pricing.md"
+PRICING_FETCH_TIMEOUT = 20
+
+
+def default_pricing_path():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "claude-usage", "pricing.json")
+
+
+def load_pricing_file(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        try:
+            return json.load(fh)
+        except ValueError:
+            return None
+
+
+def load_fetched_pricing(path):
+    doc = load_pricing_file(path)
+    return doc if doc and isinstance(doc.get("models"), dict) else None
+
+
+def save_pricing_file(path, doc):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def fetch_pricing_markdown(url, timeout):
+    req = urllib.request.Request(url, headers={"User-Agent": "claude-usage"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def extract_price(cell):
+    """The first $amount in a table cell, ignoring a footnote digit glued to the unit."""
+    m = re.search(r"\$\s*([\d.]+)", cell)
+    return float(m.group(1)) if m else None
+
+
+def model_id_from_name(name):
+    """API model id for a display name, e.g. Claude Opus 4.1 (retired...) -> claude-opus-4-1."""
+    label = name.split("(")[0].strip()
+    return re.sub(r"[ .]", "-", label.lower())
+
+
+def table_rows(text):
+    """Cell lists of the first markdown table whose header has "Base input tokens"."""
+    lines = text.splitlines()
+    header = next((i for i, l in enumerate(lines) if l.strip().startswith("|") and "Base input tokens" in l), None)
+    if header is None:
+        return []
+    data = takewhile(lambda l: l.strip().startswith("|"), lines[header + 2:])
+    return [[c.strip() for c in l.strip().strip("|").split("|")] for l in data]
+
+
+def price_row(cells):
+    """One table row -> (model id, rates), or None for a non-model or incomplete row."""
+    name = cells[0] if cells else ""
+    if not name.startswith("Claude ") or len(cells) < 6:
+        return None
+    prices = [extract_price(c) for c in cells[1:6]]
+    if any(p is None for p in prices):
+        return None
+    input_rate, write5, write1, read, output = prices
+    return model_id_from_name(name), {
+        "input": input_rate, "cache_write_5m": write5, "cache_write_1h": write1,
+        "cache_read": read, "output": output,
+    }
+
+
+def parse_pricing_table(text):
+    return dict(r for r in map(price_row, table_rows(text)) if r is not None)
+
+
+def pricing_diff(old, new):
+    """(added, removed, changed) model ids between two id -> rates dicts."""
+    added = sorted(set(new) - set(old))
+    removed = sorted(set(old) - set(new))
+    changed = sorted(k for k in set(old) & set(new) if old[k] != new[k])
+    return added, removed, changed
+
+
+def build_update_parser():
+    return argparse.ArgumentParser(
+        prog="claude-usage update",
+        description="Fetch current Claude model prices from Anthropic's pricing page and store them "
+                     "at {} for future reports.".format(display_path(default_pricing_path())))
+
+
+def run_update(argv):
+    build_update_parser().parse_args(argv)
+    try:
+        text = fetch_pricing_markdown(PRICING_SOURCE_URL, PRICING_FETCH_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        print("could not fetch {}: HTTP {} {}".format(PRICING_SOURCE_URL, e.code, e.reason), file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, OSError) as e:
+        print("could not fetch {}: {}".format(PRICING_SOURCE_URL, getattr(e, "reason", e)), file=sys.stderr)
+        return 1
+    models = parse_pricing_table(text)
+    if len(models) < 5:
+        print("only {} model(s) parsed from {}, expected a pricing table with 'Base input tokens'; "
+              "not writing anything".format(len(models), PRICING_SOURCE_URL), file=sys.stderr)
+        return 1
+    pricing_path = default_pricing_path()
+    previous = load_fetched_pricing(pricing_path)
+    baseline = previous["models"] if previous else PRICING
+    fetched_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    save_pricing_file(pricing_path, {"fetched_at": fetched_at, "source": PRICING_SOURCE_URL, "models": models})
+    added, removed, changed = pricing_diff(baseline, models)
+    print("Fetched {} models from {} at {}".format(len(models), PRICING_SOURCE_URL, fetched_at))
+    if added:
+        print("  new: {}".format(", ".join(added)))
+    if removed:
+        print("  removed: {}".format(", ".join(removed)))
+    if changed:
+        print("  changed: {}".format(", ".join(changed)))
+    if not (added or removed or changed):
+        print("  no changes from the prices in effect before this update")
+    print("  saved to {}".format(display_path(pricing_path)))
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Import of Claude Code's own stats cache (approximate history)
 # --------------------------------------------------------------------------
 
@@ -377,11 +533,19 @@ def row_cost(r, pricing):
     key = price_key(r["m"], pricing)
     if key is None:
         return None
-    inp, out, read = pricing[key]
+    rates = pricing[key]
     mult = FAST_MODE_MULTIPLIER if r.get("f") and key in FAST_MODE_MODELS else 1.0
-    raw = (r["i"] * inp + r["o"] * out + r["r"] * read
-           + r["w5"] * inp * CACHE_WRITE_5M + r["w1"] * inp * CACHE_WRITE_1H)
+    raw = (r["i"] * rates["input"] + r["o"] * rates["output"] + r["r"] * rates["cache_read"]
+           + r["w5"] * rates["cache_write_5m"] + r["w1"] * rates["cache_write_1h"])
     return mult * raw / 1e6
+
+
+def normalize_pricing_entry(v):
+    """Accept the five-rate dict shape, or the legacy [input, output, cache_read] list."""
+    if isinstance(v, dict):
+        return v
+    input_rate, output_rate, cache_read_rate = v
+    return derive_rates(input_rate, output_rate, cache_read_rate)
 
 
 def empty_summary():
@@ -558,6 +722,19 @@ def warehouse_line(info):
         info["rows"], "{:+,}".format(info["new"]), info["oldest"] or "-", display_path(info["path"]))
 
 
+def pricing_source_line(fetched):
+    if fetched:
+        host = urllib.parse.urlparse(fetched["source"]).netloc or fetched["source"]
+        return "  Prices: fetched {} from {}".format(fetched["fetched_at"][:10], host)
+    return "  Prices: built-in table ({}); run 'claude-usage update' for current ones".format(BUILTIN_PRICING_AS_OF)
+
+
+def pricing_source_json(fetched):
+    if fetched:
+        return {"source": "fetched", "fetched_at": fetched["fetched_at"], "url": fetched["source"]}
+    return {"source": "built-in", "as_of": BUILTIN_PRICING_AS_OF}
+
+
 def imported_line(selected, exact):
     imported = [r for r in selected if is_imported(r)]
     if not imported:
@@ -589,6 +766,7 @@ def render_report(ctx):
         period_text(selected, ctx["since"], ctx["until"]), len(machines), "" if len(machines) == 1 else "s")]
     out += machine_lines(machines)
     out.append(warehouse_line(ctx["warehouse"]))
+    out.append(pricing_source_line(ctx["fetched_pricing"]))
     if ctx["cross_dupes"]:
         out.append("  {:,} responses were present on more than one machine and are counted once.".format(ctx["cross_dupes"]))
     out += [l for l in [imported_line(selected, args.exact)] if l]
@@ -643,6 +821,7 @@ def render_json(ctx):
         "machines": [{"name": m["name"], "calls": len(m["rows"]), "error": m["error"],
                       **{k: m["meta"].get(k) for k in ("files", "seconds", "node", "projects_dir", "python")}} for m in machines],
         "warehouse": ctx["warehouse"],
+        "pricing": pricing_source_json(ctx["fetched_pricing"]),
         "cross_machine_duplicates": ctx["cross_dupes"],
         "approximate_rows": sum(1 for r in selected if is_imported(r)),
         "totals": summary_json(grand),
@@ -660,11 +839,22 @@ def render_json(ctx):
 # CLI
 # --------------------------------------------------------------------------
 
+# Subcommand name -> (one-line help, argv[1:] -> exit code). Dispatched on
+# argv[0] in main(), ahead of the report parser below, since argparse
+# subparsers and a set of top-level report flags do not mix cleanly.
+SUBCOMMANDS = {
+    "update": ("fetch current model prices from Anthropic and store them for future reports", run_update),
+}
+
+
 def build_parser():
+    subcommands_help = "\n".join("  {:<8} {}".format(name, help_text) for name, (help_text, _) in SUBCOMMANDS.items())
     p = argparse.ArgumentParser(
         prog="claude-usage",
         description="Aggregate Claude Code token usage from this machine and every SSH host in the config.",
-        epilog="Config file: %s (see the module docstring for its shape)." % CONFIG_PATH)
+        epilog="Subcommands:\n{}\nRun 'claude-usage <subcommand> --help' for details.\n\n"
+               "Config file: {} (see the module docstring for its shape).".format(subcommands_help, CONFIG_PATH),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--since", metavar="YYYY-MM-DD", help="first day to include (local time)")
     p.add_argument("--until", metavar="YYYY-MM-DD", help="last day to include (local time, inclusive)")
     p.add_argument("--last", metavar="N{d,w,m}", help="only the last N days/weeks/months (m = 30 days), e.g. 7d")
@@ -693,13 +883,21 @@ def build_parser():
 
 
 def main(argv):
+    if argv and argv[0] in SUBCOMMANDS:
+        _, run = SUBCOMMANDS[argv[0]]
+        return run(argv[1:])
     args = build_parser().parse_args(argv)
     if args.collect:
         return run_collect(args)
     cfg = load_config(args.config)
     if args.import_stats_cache:
         return run_import(args, cfg)
-    pricing = {**PRICING, **{k: tuple(v) for k, v in (cfg.get("pricing") or {}).items()}}
+    fetched_pricing = load_fetched_pricing(default_pricing_path())
+    pricing = {
+        **PRICING,
+        **(fetched_pricing["models"] if fetched_pricing else {}),
+        **{k: normalize_pricing_entry(v) for k, v in (cfg.get("pricing") or {}).items()},
+    }
     hosts = [] if args.no_remote else [normalize_host(h) for h in (args.host or cfg.get("hosts") or [])]
     ssh_options = cfg.get("ssh_options") or DEFAULT_SSH_OPTIONS
     timeout = args.timeout or cfg.get("timeout") or DEFAULT_TIMEOUT
@@ -724,6 +922,7 @@ def main(argv):
         "machines": machines, "pricing": pricing, "args": args, "since": since, "until": until,
         "selected": [r for r in rows if in_period(r, since_s, until_s)],
         "cross_dupes": len(all_rows) - len(live), "warehouse": warehouse,
+        "fetched_pricing": fetched_pricing,
     }
     print((render_json if args.json else render_report)(ctx))
     failed = [m["name"] for m in machines if m["error"]]

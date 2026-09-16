@@ -28,6 +28,7 @@ claude-usage --json               # machine-readable, same content
 claude-usage --no-remote          # this machine only
 claude-usage --host box-a --host box-b   # ad-hoc host list instead of the config
 claude-usage --no-warehouse       # live scans only, do not read or update the warehouse
+claude-usage update               # fetch current model prices from Anthropic
 ```
 
 Exit code 2 means at least one machine could not be read. The report still
@@ -53,8 +54,37 @@ never shows up as a silent zero.
 
 A host is an SSH alias from `~/.ssh/config` or a full `user@host`. A remote
 machine needs `python3` on the PATH of a non-interactive SSH shell and nothing
-else. `pricing` overrides or extends the built-in table; the three numbers are
-USD per million tokens for input, output and cache read.
+else. `pricing` overrides a model's rates; the three numbers are USD per
+million tokens for input, output and cache read, and the cache-write rates
+are derived from them. It also accepts the five-key shape `claude-usage
+update` writes (`input`, `output`, `cache_read`, `cache_write_5m`,
+`cache_write_1h`) to set the cache-write rates directly.
+
+## Prices
+
+Cost estimates use Anthropic's published API list prices, kept in a table
+built into the script. Run `claude-usage update` to fetch current prices from
+Anthropic's pricing page and store them at
+`~/.local/share/claude-usage/pricing.json` (or
+`$XDG_DATA_HOME/claude-usage/pricing.json`). A report then reads that file
+instead of the built-in table.
+
+Precedence at report time: a `pricing` entry in the config file overrides the
+fetched file, and the fetched file overrides the built-in table. The report
+header states which one is in effect, for example:
+
+```
+Prices: fetched 2026-09-16 from platform.claude.com
+Prices: built-in table (2026-09); run 'claude-usage update' for current ones
+```
+
+The same fact is in the `--json` output under a `pricing` key.
+
+`claude-usage update` prints how many models it parsed and a diff against the
+prices that were in effect before the run, so running it twice in a row with
+no upstream change reports nothing changed. It refuses to write anything if
+the pricing page does not parse into at least five models, and exits with an
+error naming what went wrong.
 
 ## Warehouse
 
@@ -123,7 +153,8 @@ comparable number. Rates: input and output per model; cache read per model;
 cache writes at 1.25x (5 min) and 2x (1 h) of the input rate; fast mode on
 Opus 5 and Opus 4.8 at 2x every rate. Server tool calls (web search) are not
 priced. A model missing from the table prints a warning and its tokens are
-excluded from the cost, never silently priced at zero.
+excluded from the cost, never silently priced at zero. See "Prices" above for
+where the rates come from and how to update them.
 
 **Model share** is shown both by tokens and by cost. Since cache reads
 dominate the token count, the two differ a lot.
