@@ -28,12 +28,38 @@ claude-usage --json               # machine-readable, same content
 claude-usage --no-remote          # this machine only
 claude-usage --host box-a --host box-b   # ad-hoc host list instead of the config
 claude-usage --no-warehouse       # live scans only, do not read or update the warehouse
+claude-usage setup                # wizard: add/edit/remove SSH hosts, fetch current prices
 claude-usage update               # fetch current model prices from Anthropic
 ```
 
 Exit code 2 means at least one machine could not be read. The report still
 prints, with that machine marked FAILED in the header, so a missing machine
 never shows up as a silent zero.
+
+## Setup
+
+`claude-usage` works on the local machine with no config at all. When the
+config file (`~/.config/claude-usage/config.json`, or the path given to
+`--config`) does not exist, the report header adds a line pointing at
+`claude-usage setup`, and `--json` output carries `"setup_done": false`. The
+file's existence is the only marker that setup has run; a hand-written config
+counts too, and the hint disappears as soon as one exists.
+
+`claude-usage setup` is an interactive wizard: plain `input()` and `print()`,
+no curses, no dependencies. It lists the hosts already configured and asks,
+for each one, to keep it, edit it or remove it, then asks repeatedly whether
+to add another. Every host in the resulting list is then verified by actually
+running the collector over SSH; a host that fails verification can be edited,
+removed, or kept anyway, and an edit is verified again. The wizard writes the
+config file even when it ends up with zero hosts, since writing the file is
+what makes the missing-setup hint go away. Existing config keys other than
+`hosts` (`ssh_options`, `timeout`, `warehouse`, `pricing`, and anything else)
+are kept unchanged.
+
+Setup is repeatable at any time to add, edit or remove hosts. If there was no
+config before this run, it fetches current model prices right away; if there
+was one, it asks first. Prices can also be fetched on their own with
+`claude-usage update`, see below.
 
 ## Config
 
