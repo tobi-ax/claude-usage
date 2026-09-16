@@ -15,7 +15,10 @@ after the transcripts are gone. Reports read the warehouse plus fresh scans.
 Remote hosts need nothing installed except python3: the tool sends this file
 over SSH and runs it there as `python3 - --collect`.
 
-Config (optional): ~/.config/claude-usage/config.json
+Config (optional): ~/.config/claude-usage/config.json. Run `claude-usage setup`
+for an interactive wizard that adds, edits or removes hosts, verifies each one
+over SSH, and fetches current prices. Without a config, the tool still runs
+against this machine alone and prints a hint that setup was never run.
   {
     "hosts": [
       "tobi.coder",
@@ -217,6 +220,19 @@ def normalize_host(h):
         "ssh": spec["ssh"],
         "python": spec.get("python") or "python3",
         "projects_dir": spec.get("projects_dir"),
+    }
+
+
+def host_to_config(host):
+    """The config-file form of a normalized host: a bare string when every optional field is
+    at its default, otherwise the object form carrying only the fields that differ."""
+    if host["name"] == host["ssh"] and host["python"] == "python3" and not host["projects_dir"]:
+        return host["ssh"]
+    return {
+        "ssh": host["ssh"],
+        **({"name": host["name"]} if host["name"] != host["ssh"] else {}),
+        **({"projects_dir": host["projects_dir"]} if host["projects_dir"] else {}),
+        **({"python": host["python"]} if host["python"] != "python3" else {}),
     }
 
 
@@ -524,6 +540,159 @@ def run_update(argv):
     override_line = override_report_line(sorted(load_config(args.config).get("pricing") or {}))
     if override_line:
         print(override_line)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Setup wizard: add/edit/remove SSH hosts, verify them, fetch prices
+# --------------------------------------------------------------------------
+
+def prompt_default(label, default):
+    return input("  {} [{}]: ".format(label, default)).strip() or default
+
+
+def prompt_required(label):
+    while True:
+        value = input("  {}: ".format(label)).strip()
+        if value:
+            return value
+        print("  required.")
+
+
+def ask_yes_no(prompt, default):
+    raw = input("{} [{}]: ".format(prompt, "Y/n" if default else "y/N")).strip().lower()
+    return raw.startswith("y") if raw else default
+
+
+def ask_choice(prompt, letters, default):
+    raw = input("{} [{}]: ".format(prompt, default)).strip().lower()
+    return raw if raw in letters else default
+
+
+def describe_host(host, index):
+    return "  {}. {}  (name={} projects_dir={} python={})".format(
+        index, host["ssh"], host["name"], host["projects_dir"] or DEFAULT_PROJECTS_DIR, host["python"])
+
+
+def prompt_host(existing=None):
+    """Ask the four host fields; `existing` (a normalized host) seeds the defaults, or None to add one."""
+    ssh = prompt_default("SSH target", existing["ssh"]) if existing else prompt_required(
+        "SSH target (an alias from ~/.ssh/config or user@host)")
+    name = prompt_default("Display name", (existing or {}).get("name") or ssh)
+    projects_dir = prompt_default("Projects dir", (existing or {}).get("projects_dir") or DEFAULT_PROJECTS_DIR)
+    python = prompt_default("Python", (existing or {}).get("python") or "python3")
+    return normalize_host({
+        "ssh": ssh, "name": name, "python": python,
+        "projects_dir": None if projects_dir == DEFAULT_PROJECTS_DIR else projects_dir,
+    })
+
+
+def review_existing_hosts(hosts):
+    """Ask [k]eep/[e]dit/[r]emove for each configured host; returns the updated list."""
+    def review_one(index, host):
+        print(describe_host(host, index))
+        choice = ask_choice("     [k]eep / [e]dit / [r]emove", {"k", "e", "r"}, "k")
+        if choice == "r":
+            return None
+        return prompt_host(existing=host) if choice == "e" else host
+    return [h for h in (review_one(i, host) for i, host in enumerate(hosts, 1)) if h is not None]
+
+
+def add_new_hosts(hosts):
+    """Ask "Add an SSH host?" until declined; returns hosts plus every one added."""
+    while ask_yes_no("Add an SSH host?", False):
+        hosts = hosts + [prompt_host()]
+    return hosts
+
+
+def verify_host_once(host, source, ssh_options, timeout):
+    """Run the collector over SSH once; (ok, detail) where detail is the summary or the error."""
+    m = fetch_remote(host, source, ssh_options, timeout)
+    if m["error"]:
+        return False, m["error"]
+    meta = m["meta"]
+    return True, "{} responses, {} files, python {}".format(len(m["rows"]), meta.get("files", 0), meta.get("python", "?"))
+
+
+def verify_host(host, source, ssh_options, timeout):
+    """Verify one host; on failure ask [e]dit/[r]emove/[k]eep anyway, re-verifying after an edit."""
+    while True:
+        ok, detail = verify_host_once(host, source, ssh_options, timeout)
+        print("  {}: {}".format(host["ssh"], ("ok: " if ok else "FAILED: ") + detail))
+        if ok:
+            return host
+        choice = ask_choice("     [e]dit / [r]emove / [k]eep anyway", {"e", "r", "k"}, "k")
+        if choice == "r":
+            return None
+        if choice == "e":
+            host = prompt_host(existing=host)
+            continue
+        return host
+
+
+def verify_hosts(hosts, ssh_options, timeout):
+    source = read_self()
+    return [h for h in (verify_host(host, source, ssh_options, timeout) for host in hosts) if h is not None]
+
+
+def save_config(path, doc):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def build_setup_parser():
+    p = argparse.ArgumentParser(
+        prog="claude-usage setup",
+        description="Interactive wizard to add, edit or remove SSH hosts, verify them over SSH, and fetch "
+                     "current model prices. Repeatable; edits the existing config if there is one.")
+    p.add_argument("--config", default=CONFIG_PATH, help="config file to read and write (default: %(default)s)")
+    return p
+
+
+def run_setup(argv):
+    args = build_setup_parser().parse_args(argv)
+    path = args.config
+    existed_before = os.path.exists(path)
+    cfg = load_config(path)
+
+    try:
+        hosts = [normalize_host(h) for h in (cfg.get("hosts") or [])]
+        print("claude-usage setup -> {}".format(display_path(path)))
+        if hosts:
+            print("Configured hosts:")
+            hosts = review_existing_hosts(hosts)
+        hosts = add_new_hosts(hosts)
+        if hosts:
+            print("Verifying hosts...")
+            ssh_options = cfg.get("ssh_options") or DEFAULT_SSH_OPTIONS
+            timeout = cfg.get("timeout") or DEFAULT_TIMEOUT
+            hosts = verify_hosts(hosts, ssh_options, timeout)
+        save_config(path, {**cfg, "hosts": [host_to_config(h) for h in hosts]})
+        print("Wrote {} ({} host{}).".format(display_path(path), len(hosts), "" if len(hosts) == 1 else "s"))
+    except EOFError:
+        print("\nsetup aborted: no input, nothing was written.", file=sys.stderr)
+        return 1
+
+    if not existed_before:
+        print("No prior config, fetching current model prices now.")
+        do_update = True
+    else:
+        try:
+            do_update = ask_yes_no("Fetch current models and prices now?", True)
+        except EOFError:
+            print("\nno input; skipping the price update. Run 'claude-usage update' to fetch prices later.",
+                  file=sys.stderr)
+            return 0
+    if not do_update:
+        return 0
+    if run_update([]) != 0:
+        print("price update failed; {} was still written. Retry with 'claude-usage update'.".format(
+            display_path(path)), file=sys.stderr)
+        return 1
     return 0
 
 
@@ -883,6 +1052,8 @@ def render_report(ctx):
     unpriced_models = sorted({r["m"] for r in selected if price_key(r["m"], pricing) is None})
     out = ["Claude Code usage  ·  {}  ·  {} machine{}".format(
         period_text(selected, ctx["since"], ctx["until"]), len(machines), "" if len(machines) == 1 else "s")]
+    if not ctx["setup_done"]:
+        out.append("  No config yet: run 'claude-usage setup' to add SSH hosts and fetch current prices.")
     out += machine_lines(machines)
     out.append(warehouse_line(ctx["warehouse"]))
     out.append(pricing_source_line(ctx["fetched_pricing"], ctx["pricing_overrides"], ctx["pricing_builtin_only"]))
@@ -937,6 +1108,7 @@ def render_json(ctx):
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "period": {"since": since.strftime("%Y-%m-%d") if since else None,
                    "until_inclusive": (until - timedelta(days=1)).strftime("%Y-%m-%d") if until else None},
+        "setup_done": ctx["setup_done"],
         "machines": [{"name": m["name"], "calls": len(m["rows"]), "error": m["error"],
                       **{k: m["meta"].get(k) for k in ("files", "seconds", "node", "projects_dir", "python")}} for m in machines],
         "warehouse": ctx["warehouse"],
@@ -962,6 +1134,7 @@ def render_json(ctx):
 # argv[0] in main(), ahead of the report parser below, since argparse
 # subparsers and a set of top-level report flags do not mix cleanly.
 SUBCOMMANDS = {
+    "setup": ("interactive wizard: add/edit/remove SSH hosts, verify them, fetch current prices", run_setup),
     "update": ("fetch current model prices from Anthropic and store them for future reports", run_update),
 }
 
@@ -1008,6 +1181,7 @@ def main(argv):
     args = build_parser().parse_args(argv)
     if args.collect:
         return run_collect(args)
+    setup_done = os.path.exists(args.config)
     cfg = load_config(args.config)
     if args.import_stats_cache:
         return run_import(args, cfg)
@@ -1046,7 +1220,7 @@ def main(argv):
         "selected": [r for r in rows if in_period(r, since_s, until_s)],
         "cross_dupes": len(all_rows) - len(live), "warehouse": warehouse,
         "fetched_pricing": fetched_pricing, "pricing_overrides": pricing_overrides,
-        "pricing_builtin_only": pricing_builtin_only,
+        "pricing_builtin_only": pricing_builtin_only, "setup_done": setup_done,
     }
     print((render_json if args.json else render_report)(ctx))
     failed = [m["name"] for m in machines if m["error"]]
