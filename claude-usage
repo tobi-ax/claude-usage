@@ -353,12 +353,15 @@ def load_fetched_pricing(path):
     """
     if not os.path.exists(path):
         return None
-    with open(path, encoding="utf-8") as fh:
-        try:
+    try:
+        with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
-        except ValueError as e:
-            print("ignoring {}: not valid JSON ({})".format(display_path(path), e), file=sys.stderr)
-            return None
+    except OSError as e:
+        print("ignoring {}: cannot read it ({})".format(display_path(path), e.strerror or e), file=sys.stderr)
+        return None
+    except ValueError as e:
+        print("ignoring {}: not valid UTF-8 JSON ({})".format(display_path(path), e), file=sys.stderr)
+        return None
     error = pricing_doc_error(doc)
     if error:
         print("ignoring {}: {}".format(display_path(path), error), file=sys.stderr)
