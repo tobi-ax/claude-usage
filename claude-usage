@@ -431,14 +431,27 @@ def pricing_diff(old, new):
 
 
 def build_update_parser():
-    return argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         prog="claude-usage update",
         description="Fetch current Claude model prices from Anthropic's pricing page and store them "
                      "at {} for future reports.".format(display_path(default_pricing_path())))
+    p.add_argument("--config", default=CONFIG_PATH,
+                    help="config file to check for pricing overrides (default: %(default)s)")
+    return p
+
+
+def override_report_line(overrides):
+    if not overrides:
+        return None
+    ids = ", ".join(sorted(overrides))
+    if len(overrides) == 1:
+        return "  1 model is overridden in your config and keeps its configured rate: {}".format(ids)
+    return "  {} models are overridden in your config and keep their configured rates: {}".format(
+        len(overrides), ids)
 
 
 def run_update(argv):
-    build_update_parser().parse_args(argv)
+    args = build_update_parser().parse_args(argv)
     try:
         text = fetch_pricing_markdown(PRICING_SOURCE_URL, PRICING_FETCH_TIMEOUT)
     except urllib.error.HTTPError as e:
@@ -454,20 +467,24 @@ def run_update(argv):
         return 1
     pricing_path = default_pricing_path()
     previous = load_fetched_pricing(pricing_path)
+    baseline_label = "the previously fetched table" if previous else "the built-in table"
     baseline = previous["models"] if previous else PRICING
     fetched_at = datetime.now().astimezone().isoformat(timespec="seconds")
     save_pricing_file(pricing_path, {"fetched_at": fetched_at, "source": PRICING_SOURCE_URL, "models": models})
     added, removed, changed = pricing_diff(baseline, models)
     print("Fetched {} models from {} at {}".format(len(models), PRICING_SOURCE_URL, fetched_at))
     if added:
-        print("  new: {}".format(", ".join(added)))
+        print("  new (compared with {}): {}".format(baseline_label, ", ".join(added)))
     if removed:
-        print("  removed: {}".format(", ".join(removed)))
+        print("  removed (compared with {}): {}".format(baseline_label, ", ".join(removed)))
     if changed:
-        print("  changed: {}".format(", ".join(changed)))
+        print("  changed (compared with {}): {}".format(baseline_label, ", ".join(changed)))
     if not (added or removed or changed):
-        print("  no changes from the prices in effect before this update")
+        print("  no changes compared with {}".format(baseline_label))
     print("  saved to {}".format(display_path(pricing_path)))
+    override_line = override_report_line(sorted(load_config(args.config).get("pricing") or {}))
+    if override_line:
+        print(override_line)
     return 0
 
 
@@ -574,12 +591,26 @@ def row_cost(r, pricing):
     return mult * raw / 1e6
 
 
-def normalize_pricing_entry(v):
-    """Accept the five-rate dict shape, or the legacy [input, output, cache_read] list."""
-    if isinstance(v, dict):
+def is_three_number_list(v):
+    return (isinstance(v, (list, tuple)) and len(v) == 3
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v))
+
+
+def validate_pricing_entry(config_path, model, v):
+    """The model's rates for a config "pricing" entry, or a SystemExit naming the problem.
+
+    A dict must be the complete five-rate shape; a list must be exactly the
+    three legacy numbers. Either shape is caught here, at config load, so a
+    malformed entry cannot reach row_cost() as a bare KeyError or TypeError.
+    """
+    if isinstance(v, dict) and is_rate_dict(v):
         return v
-    input_rate, output_rate, cache_read_rate = v
-    return derive_rates(input_rate, output_rate, cache_read_rate)
+    if is_three_number_list(v):
+        return derive_rates(*v)
+    raise SystemExit(
+        "{}: pricing entry for \"{}\" is not valid. Use either a three-number "
+        "[input, output, cache_read] list, or an object with exactly the keys {}.".format(
+            config_path, model, ", ".join(RATE_KEYS)))
 
 
 def empty_summary():
@@ -940,7 +971,7 @@ def main(argv):
     pricing = {
         **PRICING,
         **(fetched_pricing["models"] if fetched_pricing else {}),
-        **{k: normalize_pricing_entry(v) for k, v in config_pricing.items()},
+        **{k: validate_pricing_entry(args.config, k, v) for k, v in config_pricing.items()},
     }
     hosts = [] if args.no_remote else [normalize_host(h) for h in (args.host or cfg.get("hosts") or [])]
     ssh_options = cfg.get("ssh_options") or DEFAULT_SSH_OPTIONS
