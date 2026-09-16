@@ -636,7 +636,7 @@ def verify_hosts(hosts, ssh_options, timeout):
 
 
 def save_config(path, doc):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2, sort_keys=True)
