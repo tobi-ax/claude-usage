@@ -13,6 +13,23 @@ default 30). So every run folds what it found into a warehouse file, and the
 report reads warehouse plus fresh scans. Run it at least once a month, or let
 the systemd timer below do it daily, and nothing ages out uncounted.
 
+## Install
+
+Python 3.8 or newer is the only requirement; the script has no dependencies.
+Clone the repo and put a symlink on your PATH:
+
+```
+git clone git@github.com:tobi-ax/claude-usage.git ~/Code/claude-usage
+ln -s ~/Code/claude-usage/claude-usage ~/.local/bin/claude-usage
+claude-usage setup
+```
+
+The symlink points into the clone, so `git pull` updates the installed tool.
+`setup` asks for the SSH hosts to include and fetches current prices; without
+it the tool still reports this machine. Remote machines need `python3` on the
+PATH of a non-interactive SSH shell and nothing else. For the daily warehouse
+snapshot see "Daily snapshot with systemd" below.
+
 ## Run
 
 ```
