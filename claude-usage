@@ -8,6 +8,10 @@ on every SSH host in its config, counts each API response once, and prints
 tokens by type, an estimated cost at Anthropic API list prices, and the share
 per model and per machine.
 
+Claude Code deletes transcripts after 30 days (cleanupPeriodDays). Every run
+therefore merges what it found into a warehouse file, so usage stays counted
+after the transcripts are gone. Reports read the warehouse plus fresh scans.
+
 Remote hosts need nothing installed except python3: the tool sends this file
 over SSH and runs it there as `python3 - --collect`.
 
@@ -19,6 +23,7 @@ Config (optional): ~/.config/claude-usage/config.json
     ],
     "ssh_options": ["-o", "BatchMode=yes", "-o", "ConnectTimeout=20"],
     "timeout": 120,
+    "warehouse": "~/.local/share/claude-usage/rows.jsonl",
     "pricing": {"claude-some-model": [5.0, 25.0, 0.5]}
   }
 """
@@ -41,8 +46,10 @@ from itertools import groupby
 
 CONFIG_PATH = os.path.expanduser("~/.config/claude-usage/config.json")
 DEFAULT_PROJECTS_DIR = "~/.claude/projects"
+DEFAULT_STATS_CACHE = "~/.claude/stats-cache.json"
 DEFAULT_SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=20"]
 DEFAULT_TIMEOUT = 120
+IMPORTED_ENTRYPOINT = "stats-cache"
 
 # USD per million tokens: (input, output, cache read).
 # Cache writes are priced off the input rate: 1.25x for the 5-minute TTL,
@@ -132,8 +139,10 @@ def dedup(rows):
     Claude Code writes one record per content block of a streamed response,
     all with the same message id and request id. Only the last one carries
     the final output token count, so the record with the largest output
-    count wins. The same rule also folds a response that shows up on two
-    machines (a session copied between them) into one.
+    count wins. The same rule folds a response that shows up on two
+    machines (a session copied between them) into one, and lets a fresh
+    scan update a row the warehouse stored while the response was still
+    streaming.
     """
     def keep_final(acc, r):
         k = (r["id"], r["rq"])
@@ -237,6 +246,123 @@ def load_config(path):
 
 
 # --------------------------------------------------------------------------
+# Warehouse: every response ever seen, one JSON row per line
+# --------------------------------------------------------------------------
+
+def default_warehouse_path():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "claude-usage", "rows.jsonl")
+
+
+def load_warehouse(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        return [o for o in map(parse_json_line, fh) if isinstance(o, dict) and "id" in o]
+
+
+def save_warehouse(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.writelines(json.dumps(r, separators=(",", ":")) + "\n"
+                      for r in sorted(rows, key=lambda r: (r["t"], r["id"], r["rq"])))
+    os.replace(tmp, path)
+
+
+def is_imported(r):
+    return r.get("e") == IMPORTED_ENTRYPOINT
+
+
+def merge_into_warehouse(path, stored, live):
+    """Fold live rows into the stored ones; write back when anything came in."""
+    merged = dedup(stored + live)
+    if live:
+        save_warehouse(path, merged)
+    return merged, len(merged) - len(stored)
+
+
+def display_path(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+# --------------------------------------------------------------------------
+# Import of Claude Code's own stats cache (approximate history)
+# --------------------------------------------------------------------------
+
+def split_by_share(total, shares):
+    """Integers summing to total, one per share; rounding drift lands on the last."""
+    if not shares:
+        return []
+    head = [int(total * s) for s in shares[:-1]]
+    return head + [total - sum(head)]
+
+
+def stats_cache_rows(cache, machine_name):
+    """One approximate row per (day, model).
+
+    The cache stores exact per-model totals (input, output, cache write,
+    cache read) for its whole period, and per day only input+output per
+    model. Each model's totals are spread over its days by that day's share
+    of input+output. Totals per model stay exact; the per-day split is an
+    estimate. The 5 min / 1 h cache write split is not recorded, so every
+    write is priced at the cheaper 5 min rate. The rows carry n=0 so they do
+    not count as API calls.
+    """
+    totals = cache.get("modelUsage") or {}
+    daily = cache.get("dailyModelTokens") or []
+    fallback_day = cache.get("lastComputedDate") or "1970-01-01"
+
+    def rows_for(model):
+        u = totals[model]
+        days = [(d["date"], d["tokensByModel"][model]) for d in daily if model in (d.get("tokensByModel") or {})]
+        days = days if sum(n for _, n in days) > 0 else [(fallback_day, 1)]
+        denom = sum(n for _, n in days)
+        shares = [n / denom for _, n in days]
+        parts = {
+            "i": split_by_share(u.get("inputTokens") or 0, shares),
+            "o": split_by_share(u.get("outputTokens") or 0, shares),
+            "w5": split_by_share(u.get("cacheCreationInputTokens") or 0, shares),
+            "r": split_by_share(u.get("cacheReadInputTokens") or 0, shares),
+        }
+        return [{
+            "id": "stats-cache:%s:%s:%s" % (machine_name, date, model), "rq": "",
+            "t": date + "T12:00:00.000Z", "m": model,
+            "i": parts["i"][idx], "o": parts["o"][idx], "w5": parts["w5"][idx], "w1": 0, "r": parts["r"][idx],
+            "f": 0, "e": IMPORTED_ENTRYPOINT, "s": "", "p": "", "n": 0, "mach": machine_name,
+        } for idx, (date, _) in enumerate(days)]
+
+    return [r for m in totals for r in rows_for(m) if any(r[k] for k in TOKEN_KEYS)]
+
+
+def run_import(args, cfg):
+    path = os.path.expanduser(args.import_stats_cache)
+    if not os.path.exists(path):
+        raise SystemExit("stats cache not found: %s" % path)
+    with open(path, encoding="utf-8") as fh:
+        cache = json.load(fh)
+    machine_name = args.import_machine or platform.node()
+    warehouse_path = os.path.expanduser(args.warehouse or cfg.get("warehouse") or default_warehouse_path())
+    stored = load_warehouse(warehouse_path)
+    live = local_machine(args.projects_dir)["rows"] if machine_name == platform.node() else []
+    real = [r for r in stored + live if r.get("mach") == machine_name and not is_imported(r)]
+    cutoff = min(r["t"][:10] for r in real) if real else None
+    candidates = stats_cache_rows(cache, machine_name)
+    imported = [r for r in candidates if cutoff is None or r["t"][:10] < cutoff]
+    merged, _ = merge_into_warehouse(warehouse_path, stored, live + imported)
+    dates = sorted(r["t"][:10] for r in imported)
+    print("Imported {:,} approximate model-day rows for {} from {}".format(len(imported), machine_name, path))
+    if imported:
+        print("  period {} to {}, models: {}".format(dates[0], dates[-1], ", ".join(sorted({r["m"] for r in imported}))))
+    if cutoff:
+        print("  skipped {:,} rows on or after {} (real transcript data exists from there)".format(
+            len(candidates) - len(imported), cutoff))
+    print("  warehouse now holds {:,} rows at {}".format(len(merged), display_path(warehouse_path)))
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Pricing and summaries
 # --------------------------------------------------------------------------
 
@@ -252,7 +378,7 @@ def row_cost(r, pricing):
     if key is None:
         return None
     inp, out, read = pricing[key]
-    mult = FAST_MODE_MULTIPLIER if r["f"] and key in FAST_MODE_MODELS else 1.0
+    mult = FAST_MODE_MULTIPLIER if r.get("f") and key in FAST_MODE_MODELS else 1.0
     raw = (r["i"] * inp + r["o"] * out + r["r"] * read
            + r["w5"] * inp * CACHE_WRITE_5M + r["w1"] * inp * CACHE_WRITE_1H)
     return mult * raw / 1e6
@@ -268,7 +394,7 @@ def summarize(rows, pricing):
         return {
             **acc,
             **{k: acc[k] + r[k] for k in TOKEN_KEYS},
-            "calls": acc["calls"] + 1,
+            "calls": acc["calls"] + r.get("n", 1),
             "cost": acc["cost"] + (c if c is not None else 0.0),
             "unpriced": acc["unpriced"] + (0 if c is not None else sum(r[k] for k in TOKEN_KEYS)),
         }
@@ -298,7 +424,7 @@ def local_bucket(fmt):
 
 
 def model_label(r):
-    return r["m"] + (" (fast)" if r["f"] else "")
+    return r["m"] + (" (fast)" if r.get("f") else "")
 
 
 GROUPINGS = {
@@ -400,9 +526,10 @@ def by_cost_desc(groups):
 def session_table(rows, pricing, exact, top):
     def key(r):
         return (r["mach"], r["s"])
-    groups = group(rows, key, pricing)
-    firsts = {k: min(r["t"] for r in g) for k, g in groupby(sorted(rows, key=key), key=key)}
-    cwds = {k: next(iter(g))["p"] for k, g in groupby(sorted(rows, key=key), key=key)}
+    real = [r for r in rows if not is_imported(r)]
+    groups = group(real, key, pricing)
+    firsts = {k: min(r["t"] for r in g) for k, g in groupby(sorted(real, key=key), key=key)}
+    cwds = {k: next(iter(g))["p"] for k, g in groupby(sorted(real, key=key), key=key)}
     keys = by_cost_desc(groups)[:top]
     headers = ["Session", "Machine", "Project", "First seen", "Calls", "Total", "Cost"]
     body = [[k[1][:8] or "?", k[0], os.path.basename(cwds[k].rstrip("/")) or cwds[k] or "?",
@@ -424,6 +551,25 @@ def machine_lines(machines):
     return [line(m) for m in machines]
 
 
+def warehouse_line(info):
+    if info is None:
+        return "  Warehouse: not used (--no-warehouse)"
+    return "  Warehouse: {:,} responses ({} new this run), oldest {}, {}".format(
+        info["rows"], "{:+,}".format(info["new"]), info["oldest"] or "-", display_path(info["path"]))
+
+
+def imported_line(selected, exact):
+    imported = [r for r in selected if is_imported(r)]
+    if not imported:
+        return None
+    dates = sorted(r["t"][:10] for r in imported)
+    machines = sorted({r["mach"] for r in imported})
+    return ("  Approximate: {} model-day rows imported from Claude's stats cache cover {} to {} on {}"
+            " ({} tokens). Exact per model, split across days by share, not counted as API calls.").format(
+        len(imported), dates[0], dates[-1], ", ".join(machines),
+        fmt_tok(sum(r[k] for r in imported for k in TOKEN_KEYS), exact))
+
+
 def period_text(selected, since, until):
     if since or until:
         return "{} to {}".format(since.strftime("%Y-%m-%d") if since else "start",
@@ -435,14 +581,17 @@ def period_text(selected, since, until):
     return "{} to {} (all data)".format(stamps[0], stamps[-1])
 
 
-def render_report(machines, selected, cross_dupes, since, until, pricing, args):
+def render_report(ctx):
+    machines, selected, pricing, args = ctx["machines"], ctx["selected"], ctx["pricing"], ctx["args"]
     grand = summarize(selected, pricing)
     unpriced_models = sorted({r["m"] for r in selected if price_key(r["m"], pricing) is None})
     out = ["Claude Code usage  ·  {}  ·  {} machine{}".format(
-        period_text(selected, since, until), len(machines), "" if len(machines) == 1 else "s")]
+        period_text(selected, ctx["since"], ctx["until"]), len(machines), "" if len(machines) == 1 else "s")]
     out += machine_lines(machines)
-    if cross_dupes:
-        out.append("  {:,} responses were present on more than one machine and are counted once.".format(cross_dupes))
+    out.append(warehouse_line(ctx["warehouse"]))
+    if ctx["cross_dupes"]:
+        out.append("  {:,} responses were present on more than one machine and are counted once.".format(ctx["cross_dupes"]))
+    out += [l for l in [imported_line(selected, args.exact)] if l]
     out.append("  Times and day buckets use this machine's local timezone.")
     out.append("")
     out.append("Tokens")
@@ -483,7 +632,9 @@ def summary_json(s):
             "calls": s["calls"], "cost_usd": round(s["cost"], 4), "unpriced_tokens": s["unpriced"]}
 
 
-def render_json(machines, selected, cross_dupes, since, until, pricing, args):
+def render_json(ctx):
+    machines, selected, pricing, args = ctx["machines"], ctx["selected"], ctx["pricing"], ctx["args"]
+    since, until = ctx["since"], ctx["until"]
     grand = summarize(selected, pricing)
     doc = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -491,7 +642,9 @@ def render_json(machines, selected, cross_dupes, since, until, pricing, args):
                    "until_inclusive": (until - timedelta(days=1)).strftime("%Y-%m-%d") if until else None},
         "machines": [{"name": m["name"], "calls": len(m["rows"]), "error": m["error"],
                       **{k: m["meta"].get(k) for k in ("files", "seconds", "node", "projects_dir", "python")}} for m in machines],
-        "cross_machine_duplicates": cross_dupes,
+        "warehouse": ctx["warehouse"],
+        "cross_machine_duplicates": ctx["cross_dupes"],
+        "approximate_rows": sum(1 for r in selected if is_imported(r)),
         "totals": summary_json(grand),
         "unpriced_models": sorted({r["m"] for r in selected if price_key(r["m"], pricing) is None}),
         "by_model": {k: summary_json(v) for k, v in group(selected, model_label, pricing).items()},
@@ -526,6 +679,13 @@ def build_parser():
     p.add_argument("--projects-dir", default=DEFAULT_PROJECTS_DIR,
                    help="transcript folder on this machine (default: %(default)s)")
     p.add_argument("--timeout", type=int, help="seconds to wait per SSH host (default: config or %d)" % DEFAULT_TIMEOUT)
+    p.add_argument("--warehouse", metavar="PATH",
+                   help="where every seen response is kept (default: config or %s)" % display_path(default_warehouse_path()))
+    p.add_argument("--no-warehouse", action="store_true", help="neither read nor update the warehouse; live scans only")
+    p.add_argument("--import-stats-cache", metavar="PATH", nargs="?", const=DEFAULT_STATS_CACHE,
+                   help="one-off: import Claude's stats-cache.json (default %s) as approximate history "
+                        "for days before the oldest real transcript, then exit" % DEFAULT_STATS_CACHE)
+    p.add_argument("--import-machine", metavar="NAME", help="machine name for the imported rows (default: this host)")
     p.add_argument("--exact", action="store_true", help="print exact token counts instead of k/M")
     p.add_argument("--json", action="store_true", help="print JSON instead of the text report")
     p.add_argument("--collect", action="store_true", help=argparse.SUPPRESS)
@@ -537,24 +697,35 @@ def main(argv):
     if args.collect:
         return run_collect(args)
     cfg = load_config(args.config)
+    if args.import_stats_cache:
+        return run_import(args, cfg)
     pricing = {**PRICING, **{k: tuple(v) for k, v in (cfg.get("pricing") or {}).items()}}
     hosts = [] if args.no_remote else [normalize_host(h) for h in (args.host or cfg.get("hosts") or [])]
     ssh_options = cfg.get("ssh_options") or DEFAULT_SSH_OPTIONS
     timeout = args.timeout or cfg.get("timeout") or DEFAULT_TIMEOUT
-    if args.no_local and not hosts:
-        raise SystemExit("nothing to scan: --no-local given and no SSH hosts configured")
+    warehouse_path = os.path.expanduser(args.warehouse or cfg.get("warehouse") or default_warehouse_path())
+    if args.no_local and not hosts and args.no_warehouse:
+        raise SystemExit("nothing to scan: --no-local, no SSH hosts and --no-warehouse")
     source = read_self() if hosts else ""
     with ThreadPoolExecutor(max_workers=len(hosts) + 1) as ex:
         local = [] if args.no_local else [ex.submit(local_machine, args.projects_dir)]
         remote = [ex.submit(fetch_remote, h, source, ssh_options, timeout) for h in hosts]
         machines = [f.result() for f in local + remote]
     all_rows = [r for m in machines for r in m["rows"]]
-    rows = dedup(all_rows)
+    live = dedup(all_rows)
+    stored = [] if args.no_warehouse else load_warehouse(warehouse_path)
+    rows, new = (live, 0) if args.no_warehouse else merge_into_warehouse(warehouse_path, stored, live)
+    warehouse = None if args.no_warehouse else {
+        "path": warehouse_path, "rows": len(rows), "new": new,
+        "oldest": min((r["t"][:10] for r in rows), default=None)}
     since, until = period_bounds(args)
     since_s, until_s = to_utc_iso(since), to_utc_iso(until)
-    selected = [r for r in rows if in_period(r, since_s, until_s)]
-    render = render_json if args.json else render_report
-    print(render(machines, selected, len(all_rows) - len(rows), since, until, pricing, args))
+    ctx = {
+        "machines": machines, "pricing": pricing, "args": args, "since": since, "until": until,
+        "selected": [r for r in rows if in_period(r, since_s, until_s)],
+        "cross_dupes": len(all_rows) - len(live), "warehouse": warehouse,
+    }
+    print((render_json if args.json else render_report)(ctx))
     failed = [m["name"] for m in machines if m["error"]]
     if failed:
         sys.stdout.flush()

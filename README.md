@@ -8,6 +8,11 @@ the model and the API usage counters of that response. `claude-usage` reads
 those files on this machine, ships itself over SSH to every other configured
 machine to do the same there, and merges the result.
 
+Claude Code also deletes those transcripts after 30 days (`cleanupPeriodDays`,
+default 30). So every run folds what it found into a warehouse file, and the
+report reads warehouse plus fresh scans. Run it at least once a month, or let
+the systemd timer below do it daily, and nothing ages out uncounted.
+
 ## Run
 
 ```
@@ -22,6 +27,7 @@ claude-usage --exact              # full token counts instead of 1.2M
 claude-usage --json               # machine-readable, same content
 claude-usage --no-remote          # this machine only
 claude-usage --host box-a --host box-b   # ad-hoc host list instead of the config
+claude-usage --no-warehouse       # live scans only, do not read or update the warehouse
 ```
 
 Exit code 2 means at least one machine could not be read. The report still
@@ -40,6 +46,7 @@ never shows up as a silent zero.
   ],
   "ssh_options": ["-o", "BatchMode=yes", "-o", "ConnectTimeout=20"],
   "timeout": 120,
+  "warehouse": "~/.local/share/claude-usage/rows.jsonl",
   "pricing": {"claude-new-model": [5.0, 25.0, 0.5]}
 }
 ```
@@ -48,6 +55,55 @@ A host is an SSH alias from `~/.ssh/config` or a full `user@host`. A remote
 machine needs `python3` on the PATH of a non-interactive SSH shell and nothing
 else. `pricing` overrides or extends the built-in table; the three numbers are
 USD per million tokens for input, output and cache read.
+
+## Warehouse
+
+`~/.local/share/claude-usage/rows.jsonl` (or `$XDG_DATA_HOME/claude-usage/`,
+or the `warehouse` config key). One JSON row per API response, about 200
+bytes each, so a few megabytes a year. Every run merges the fresh scans into
+it with the same one-row-per-response rule and rewrites it atomically. The
+report header shows how many rows it holds, how many this run added, and the
+oldest day. Rows keep the machine name they were first seen under, so renaming
+a host in the config starts a new machine in the report.
+
+Only the machine running the report has the warehouse. Remote machines are
+scanned live each time, so a remote machine that is gone for good still
+counts as long as this machine saw it before its transcripts expired.
+
+### Daily snapshot with systemd
+
+```
+cp systemd/claude-usage.service systemd/claude-usage.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now claude-usage.timer
+systemctl --user list-timers claude-usage.timer
+journalctl --user -u claude-usage.service -n 20
+```
+
+The service runs `~/.local/bin/claude-usage --json` once a day (with a random
+delay of up to 30 minutes, catching up after downtime) and discards the
+report. The warehouse update is the point. A failed host shows up in the
+journal.
+
+### One-off import of Claude's own stats cache
+
+`~/.claude/stats-cache.json` is a snapshot Claude Code computed at some point
+and may hold per-day tokens by model from before your oldest transcript.
+
+```
+claude-usage --import-stats-cache            # ~/.claude/stats-cache.json, this machine
+claude-usage --import-stats-cache PATH --import-machine NAME
+```
+
+The cache stores exact per-model totals for its whole period (input, output,
+cache write, cache read) and per day only input plus output per model. The
+import spreads each model's totals over its days by that day's share, so the
+per-model totals are exact and the per-day split is an estimate. The 5 min vs
+1 h cache write split is not recorded, so writes are priced at the cheaper
+5 min rate. Only days before the oldest real transcript row of that machine
+are imported, so nothing is counted twice. Imported rows do not count as API
+calls, show up as entrypoint `stats-cache`, and the report header says how
+many there are. Re-running the import replaces the earlier import.
 
 ## What the numbers mean
 

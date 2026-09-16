@@ -1,0 +1,10 @@
+[Unit]
+Description=Fold Claude Code usage from all machines into the claude-usage warehouse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-usage --json
+StandardOutput=null
+StandardError=journal
