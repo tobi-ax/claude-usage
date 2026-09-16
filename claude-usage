@@ -38,12 +38,14 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import platform
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -322,9 +324,12 @@ def default_pricing_path():
     return os.path.join(base, "claude-usage", "pricing.json")
 
 
+def is_finite_number(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
 def is_rate_dict(v):
-    return (isinstance(v, dict) and set(v) == set(RATE_KEYS)
-            and all(isinstance(v[k], (int, float)) and not isinstance(v[k], bool) for k in RATE_KEYS))
+    return isinstance(v, dict) and set(v) == set(RATE_KEYS) and all(is_finite_number(v[k]) for k in RATE_KEYS)
 
 
 def pricing_doc_error(doc):
@@ -333,6 +338,8 @@ def pricing_doc_error(doc):
         return "top level is not an object"
     if not isinstance(doc.get("models"), dict):
         return "\"models\" is missing or not an object"
+    if not doc["models"]:
+        return "\"models\" is empty"
     bad = sorted(k for k, v in doc["models"].items() if not is_rate_dict(v))
     if bad:
         return "model(s) without all five numeric rates: {}".format(", ".join(bad))
@@ -359,8 +366,11 @@ def load_fetched_pricing(path):
     except OSError as e:
         print("ignoring {}: cannot read it ({})".format(display_path(path), e.strerror or e), file=sys.stderr)
         return None
+    except UnicodeDecodeError as e:
+        print("ignoring {}: not valid UTF-8 ({})".format(display_path(path), e), file=sys.stderr)
+        return None
     except ValueError as e:
-        print("ignoring {}: not valid UTF-8 JSON ({})".format(display_path(path), e), file=sys.stderr)
+        print("ignoring {}: not valid JSON ({})".format(display_path(path), e), file=sys.stderr)
         return None
     error = pricing_doc_error(doc)
     if error:
@@ -370,12 +380,23 @@ def load_fetched_pricing(path):
 
 
 def save_pricing_file(path, doc):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, path)
+    """Write doc to path atomically, via its own uniquely-named temp file.
+
+    Each call gets an exclusively-created temp file in the destination
+    directory, so two concurrent `update` runs cannot interleave writes or
+    race on the final os.replace.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        os.remove(tmp)
+        raise
 
 
 def fetch_pricing_markdown(url, timeout):
@@ -391,9 +412,19 @@ def extract_price(cell):
 
 
 def model_id_from_name(name):
-    """API model id for a display name, e.g. Claude Opus 4.1 (retired...) -> claude-opus-4-1."""
+    """API model id for a display name.
+
+    Claude Opus 4.1 (retired...) -> claude-opus-4-1. Anthropic's ids for a
+    model before the 4 generation put the version ahead of the family
+    instead: Claude Haiku 3.5 -> claude-3-5-haiku.
+    """
     label = name.split("(")[0].strip()
-    return re.sub(r"[ .]", "-", label.lower())
+    m = re.match(r"Claude ([A-Za-z]+) ([\d.]+)$", label)
+    if not m:
+        return re.sub(r"[ .]", "-", label.lower())
+    family, version = m.group(1).lower(), m.group(2).replace(".", "-")
+    major = int(m.group(2).split(".")[0])
+    return "claude-{}-{}".format(version, family) if major < 4 else "claude-{}-{}".format(family, version)
 
 
 def table_rows(text):
@@ -595,8 +626,7 @@ def row_cost(r, pricing):
 
 
 def is_three_number_list(v):
-    return (isinstance(v, (list, tuple)) and len(v) == 3
-            and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v))
+    return isinstance(v, (list, tuple)) and len(v) == 3 and all(is_finite_number(x) for x in v)
 
 
 def validate_pricing_entry(config_path, model, v):
