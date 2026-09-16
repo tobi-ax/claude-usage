@@ -81,7 +81,7 @@ Prices: built-in table (2026-09); run 'claude-usage update' for current ones
 The same fact is in the `--json` output under a `pricing` key.
 
 `claude-usage update` prints how many models it parsed and a diff against the
-prices that were in effect before the run, so running it twice in a row with
+table it fetched last time, or against the built-in table on the first run, so running it twice in a row with
 no upstream change reports nothing changed. It refuses to write anything if
 the pricing page does not parse into at least five models, and exits with an
 error naming what went wrong.
