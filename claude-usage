@@ -67,6 +67,7 @@ IMPORTED_ENTRYPOINT = "stats-cache"
 BUILTIN_PRICING_AS_OF = "2026-09"
 CACHE_WRITE_5M = 1.25  # multiplier of the input rate, 5-minute cache write TTL
 CACHE_WRITE_1H = 2.0  # multiplier of the input rate, 1-hour cache write TTL
+RATE_KEYS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
 
 
 def derive_rates(input_rate, output_rate, cache_read_rate):
@@ -90,12 +91,10 @@ PRICING = {
     "claude-opus-4-6": derive_rates(5.0, 25.0, 0.5),
     "claude-opus-4-5": derive_rates(5.0, 25.0, 0.5),
     "claude-opus-4-1": derive_rates(15.0, 75.0, 1.5),
-    "claude-opus-4-0": derive_rates(15.0, 75.0, 1.5),
     "claude-opus-4": derive_rates(15.0, 75.0, 1.5),
     "claude-sonnet-5": derive_rates(2.0, 10.0, 0.2),
     "claude-sonnet-4-6": derive_rates(3.0, 15.0, 0.3),
     "claude-sonnet-4-5": derive_rates(3.0, 15.0, 0.3),
-    "claude-sonnet-4-0": derive_rates(3.0, 15.0, 0.3),
     "claude-sonnet-4": derive_rates(3.0, 15.0, 0.3),
     "claude-haiku-4-5": derive_rates(1.0, 5.0, 0.1),
 }
@@ -323,23 +322,52 @@ def default_pricing_path():
     return os.path.join(base, "claude-usage", "pricing.json")
 
 
-def load_pricing_file(path):
+def is_rate_dict(v):
+    return (isinstance(v, dict) and set(v) == set(RATE_KEYS)
+            and all(isinstance(v[k], (int, float)) and not isinstance(v[k], bool) for k in RATE_KEYS))
+
+
+def pricing_doc_error(doc):
+    """None for a well-formed pricing.json document, else why it is not."""
+    if not isinstance(doc, dict):
+        return "top level is not an object"
+    if not isinstance(doc.get("models"), dict):
+        return "\"models\" is missing or not an object"
+    bad = sorted(k for k, v in doc["models"].items() if not is_rate_dict(v))
+    if bad:
+        return "model(s) without all five numeric rates: {}".format(", ".join(bad))
+    if not isinstance(doc.get("source"), str) or not doc["source"]:
+        return "\"source\" is missing or empty"
+    if not isinstance(doc.get("fetched_at"), str) or not doc["fetched_at"]:
+        return "\"fetched_at\" is missing or empty"
+    return None
+
+
+def load_fetched_pricing(path):
+    """The pricing.json document at path, or None if it is absent or malformed.
+
+    A malformed file (present but unparseable, or parseable with the wrong
+    shape) is reported to stderr rather than dropped silently, since the
+    caller falling back to the built-in table would otherwise look the same
+    as there being no fetched file at all.
+    """
     if not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as fh:
         try:
-            return json.load(fh)
-        except ValueError:
+            doc = json.load(fh)
+        except ValueError as e:
+            print("ignoring {}: not valid JSON ({})".format(display_path(path), e), file=sys.stderr)
             return None
-
-
-def load_fetched_pricing(path):
-    doc = load_pricing_file(path)
-    return doc if doc and isinstance(doc.get("models"), dict) else None
+    error = pricing_doc_error(doc)
+    if error:
+        print("ignoring {}: {}".format(display_path(path), error), file=sys.stderr)
+        return None
+    return doc
 
 
 def save_pricing_file(path, doc):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2, sort_keys=True)
@@ -523,6 +551,12 @@ def run_import(args, cfg):
 # --------------------------------------------------------------------------
 
 def price_key(model, pricing):
+    """A model id resolves to its exact table key, or the longest key it extends.
+
+    This also covers a dated id ("claude-opus-4-1-20260101") and an alias id
+    with no distinct pricing row of its own ("claude-opus-4-0" -> the
+    "claude-opus-4" key), without either needing an explicit table entry.
+    """
     base = re.sub(r"-\d{8}$", "", model)
     if base in pricing:
         return base
@@ -722,17 +756,25 @@ def warehouse_line(info):
         info["rows"], "{:+,}".format(info["new"]), info["oldest"] or "-", display_path(info["path"]))
 
 
-def pricing_source_line(fetched):
+def override_note(overrides):
+    if not overrides:
+        return ""
+    return ", {} model{} overridden in config".format(len(overrides), "" if len(overrides) == 1 else "s")
+
+
+def pricing_source_line(fetched, overrides):
+    note = override_note(overrides)
     if fetched:
         host = urllib.parse.urlparse(fetched["source"]).netloc or fetched["source"]
-        return "  Prices: fetched {} from {}".format(fetched["fetched_at"][:10], host)
-    return "  Prices: built-in table ({}); run 'claude-usage update' for current ones".format(BUILTIN_PRICING_AS_OF)
+        return "  Prices: fetched {} from {}{}".format(fetched["fetched_at"][:10], host, note)
+    return "  Prices: built-in table ({}){}; run 'claude-usage update' for current ones".format(
+        BUILTIN_PRICING_AS_OF, note)
 
 
-def pricing_source_json(fetched):
-    if fetched:
-        return {"source": "fetched", "fetched_at": fetched["fetched_at"], "url": fetched["source"]}
-    return {"source": "built-in", "as_of": BUILTIN_PRICING_AS_OF}
+def pricing_source_json(fetched, overrides):
+    base = ({"source": "fetched", "fetched_at": fetched["fetched_at"], "url": fetched["source"]} if fetched
+            else {"source": "built-in", "as_of": BUILTIN_PRICING_AS_OF})
+    return {**base, "config_overrides": sorted(overrides)}
 
 
 def imported_line(selected, exact):
@@ -766,7 +808,7 @@ def render_report(ctx):
         period_text(selected, ctx["since"], ctx["until"]), len(machines), "" if len(machines) == 1 else "s")]
     out += machine_lines(machines)
     out.append(warehouse_line(ctx["warehouse"]))
-    out.append(pricing_source_line(ctx["fetched_pricing"]))
+    out.append(pricing_source_line(ctx["fetched_pricing"], ctx["pricing_overrides"]))
     if ctx["cross_dupes"]:
         out.append("  {:,} responses were present on more than one machine and are counted once.".format(ctx["cross_dupes"]))
     out += [l for l in [imported_line(selected, args.exact)] if l]
@@ -821,7 +863,7 @@ def render_json(ctx):
         "machines": [{"name": m["name"], "calls": len(m["rows"]), "error": m["error"],
                       **{k: m["meta"].get(k) for k in ("files", "seconds", "node", "projects_dir", "python")}} for m in machines],
         "warehouse": ctx["warehouse"],
-        "pricing": pricing_source_json(ctx["fetched_pricing"]),
+        "pricing": pricing_source_json(ctx["fetched_pricing"], ctx["pricing_overrides"]),
         "cross_machine_duplicates": ctx["cross_dupes"],
         "approximate_rows": sum(1 for r in selected if is_imported(r)),
         "totals": summary_json(grand),
@@ -893,10 +935,12 @@ def main(argv):
     if args.import_stats_cache:
         return run_import(args, cfg)
     fetched_pricing = load_fetched_pricing(default_pricing_path())
+    config_pricing = cfg.get("pricing") or {}
+    pricing_overrides = sorted(config_pricing)
     pricing = {
         **PRICING,
         **(fetched_pricing["models"] if fetched_pricing else {}),
-        **{k: normalize_pricing_entry(v) for k, v in (cfg.get("pricing") or {}).items()},
+        **{k: normalize_pricing_entry(v) for k, v in config_pricing.items()},
     }
     hosts = [] if args.no_remote else [normalize_host(h) for h in (args.host or cfg.get("hosts") or [])]
     ssh_options = cfg.get("ssh_options") or DEFAULT_SSH_OPTIONS
@@ -922,7 +966,7 @@ def main(argv):
         "machines": machines, "pricing": pricing, "args": args, "since": since, "until": until,
         "selected": [r for r in rows if in_period(r, since_s, until_s)],
         "cross_dupes": len(all_rows) - len(live), "warehouse": warehouse,
-        "fetched_pricing": fetched_pricing,
+        "fetched_pricing": fetched_pricing, "pricing_overrides": pricing_overrides,
     }
     print((render_json if args.json else render_report)(ctx))
     failed = [m["name"] for m in machines if m["error"]]
