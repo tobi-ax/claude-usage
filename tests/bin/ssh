@@ -1,0 +1,27 @@
+#!/bin/sh
+# Stand-in for ssh in the tests: runs the remote command on this machine.
+#
+# Called as `ssh [options...] HOST COMMAND`, the way claude-usage calls ssh.
+# The last argument is the remote command and runs under `sh -c` with this
+# process's stdin, so the script piped in by claude-usage reaches it.
+#
+# The host "unreachable" fails like a refused connection. When
+# FAKE_SSH_LOG is set, every call appends its arguments there, one per line,
+# followed by a "--" line.
+
+if [ -n "$FAKE_SSH_LOG" ]; then
+    printf '%s\n' "$@" -- >> "$FAKE_SSH_LOG"
+fi
+
+for last; do :; done
+for arg; do
+    [ "$arg" = "$last" ] && break
+    host=$arg
+done
+
+if [ "$host" = "unreachable" ]; then
+    echo "ssh: connect to host unreachable port 22: Connection refused" >&2
+    exit 255
+fi
+
+exec sh -c "$last"

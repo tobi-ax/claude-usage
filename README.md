@@ -214,3 +214,22 @@ they are not in this report.
 
 Records with model `<synthetic>` (rate limit notices, API errors) carry no
 usage and are skipped.
+
+## Tests
+
+The tests use pytest, which is only a development dependency; the tool itself
+still needs nothing but Python. With [uv](https://docs.astral.sh/uv/)
+installed, run them from the repo root:
+
+```
+uvx pytest                 # the offline suite
+uvx pytest -m live         # also check Anthropic's live pricing page
+uv python install 3.8      # optional: lets the suite run the remote collector under Python 3.8
+```
+
+Every test gets its own temporary `HOME` and data directory, so the suite
+never reads or writes your real config, warehouse or pricing file, and it
+fails if one of them changed during the run. Remote machines are tested
+through `tests/bin/ssh`, which runs the remote command locally. The test data
+is synthetic; real transcripts contain prompts and code and do not belong in
+this repo.
