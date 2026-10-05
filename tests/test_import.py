@@ -134,3 +134,11 @@ def test_reimport_keeps_real_rows_and_other_machines_imports(run, stats_cache, w
     rows = [json.loads(l) for l in warehouse_path.read_text().splitlines()]
     assert sorted((r["mach"], r["e"]) for r in rows) == [
         ("old-laptop", "cli"), ("old-laptop", "stats-cache"), ("other-box", "stats-cache")]
+
+
+def test_reimport_of_a_cache_without_rows_removes_the_earlier_import(run, stats_cache, warehouse_path, config_path,
+                                                                    projects_dir):
+    day = [{"date": "2026-06-01", "tokensByModel": {"claude-opus-4-8": 1}}]
+    import_into(run, config_path, projects_dir, stats_cache(cache({"claude-opus-4-8": usage(o=300)}, day)))
+    import_into(run, config_path, projects_dir, stats_cache(cache({}, [])))
+    assert warehouse_path.read_text() == ""
