@@ -761,7 +761,11 @@ def run_import(args, cfg):
     cutoff = min(r["t"][:10] for r in real) if real else None
     candidates = stats_cache_rows(cache, machine_name)
     imported = [r for r in candidates if cutoff is None or r["t"][:10] < cutoff]
-    merged, _ = merge_into_warehouse(warehouse_path, stored, live + imported)
+    # The new import replaces this machine's earlier one, so a model-day it no
+    # longer holds, or holds with lower numbers, keeps no row from before.
+    kept = [r for r in stored if not (is_imported(r) and r.get("mach") == machine_name)]
+    merged = dedup(kept + live + imported)
+    save_warehouse(warehouse_path, merged)
     dates = sorted(r["t"][:10] for r in imported)
     print("Imported {:,} approximate model-day rows for {} from {}".format(len(imported), machine_name, path))
     if imported:
