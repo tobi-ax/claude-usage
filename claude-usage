@@ -69,7 +69,7 @@ IMPORTED_ENTRYPOINT = "stats-cache"
 # cache-write rates (5-minute and 1-hour TTL). Anthropic API list prices as
 # of BUILTIN_PRICING_AS_OF; `claude-usage update` fetches current rates into
 # a pricing.json that a report prefers over this table (see price_key()).
-BUILTIN_PRICING_AS_OF = "2026-09"
+BUILTIN_PRICING_AS_OF = "2026-10"
 CACHE_WRITE_5M = 1.25  # multiplier of the input rate, 5-minute cache write TTL
 CACHE_WRITE_1H = 2.0  # multiplier of the input rate, 1-hour cache write TTL
 RATE_KEYS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
@@ -90,6 +90,7 @@ PRICING = {
     "claude-mythos-5-1": derive_rates(10.0, 50.0, 0.25),
     "claude-fable-5": derive_rates(10.0, 50.0, 1.0),
     "claude-mythos-5": derive_rates(10.0, 50.0, 1.0),
+    "claude-opus-5-5": derive_rates(4.0, 20.0, 0.2),
     "claude-opus-5": derive_rates(5.0, 25.0, 0.5),
     "claude-opus-4-8": derive_rates(5.0, 25.0, 0.5),
     "claude-opus-4-7": derive_rates(5.0, 25.0, 0.5),
@@ -97,6 +98,7 @@ PRICING = {
     "claude-opus-4-5": derive_rates(5.0, 25.0, 0.5),
     "claude-opus-4-1": derive_rates(15.0, 75.0, 1.5),
     "claude-opus-4": derive_rates(15.0, 75.0, 1.5),
+    "claude-sonnet-5-5": derive_rates(2.0, 10.0, 0.2),
     "claude-sonnet-5": derive_rates(2.0, 10.0, 0.2),
     "claude-sonnet-4-6": derive_rates(3.0, 15.0, 0.3),
     "claude-sonnet-4-5": derive_rates(3.0, 15.0, 0.3),
@@ -104,7 +106,7 @@ PRICING = {
     "claude-haiku-4-5": derive_rates(1.0, 5.0, 0.1),
 }
 FAST_MODE_MULTIPLIER = 2.0  # speed="fast" doubles every rate on these models
-FAST_MODE_MODELS = {"claude-opus-5", "claude-opus-4-8"}
+FAST_MODE_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"}
 
 TOKEN_KEYS = ("i", "w5", "w1", "r", "o")
 TOKEN_LABELS = {
@@ -776,16 +778,19 @@ def run_import(args, cfg):
 # --------------------------------------------------------------------------
 
 def price_key(model, pricing):
-    """A model id resolves to its exact table key, or the longest key it extends.
+    """A model id resolves to its exact table key, or to the key it is an alias of.
 
-    This also covers a dated id ("claude-opus-4-1-20260101") and an alias id
-    with no distinct pricing row of its own ("claude-opus-4-0" -> the
-    "claude-opus-4" key), without either needing an explicit table entry.
+    A dated id ("claude-opus-4-1-20260101") drops its date, and an alias id
+    with no pricing row of its own ("claude-opus-4-0", "claude-3-5-haiku-latest")
+    drops its "-0" or "-latest" suffix. Any other id has no key, including a
+    point release such as "claude-opus-5-5": its rates can differ from those of
+    the release it extends, so it is reported as unpriced instead.
     """
     base = re.sub(r"-\d{8}$", "", model)
     if base in pricing:
         return base
-    return next((k for k in sorted(pricing, key=len, reverse=True) if base.startswith(k + "-")), None)
+    alias = re.sub(r"-(0|latest)$", "", base)
+    return alias if alias in pricing else None
 
 
 def row_cost(r, pricing):
