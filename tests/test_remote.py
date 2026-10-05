@@ -1,14 +1,12 @@
-import os
-
 import pytest
 
-from conftest import cu, find_python38, record, write_transcript
+from conftest import cu, record, write_transcript
 
 
 @pytest.mark.parametrize("host, normalized", [
     ("box", {"name": "box", "ssh": "box", "python": "python3", "projects_dir": None}),
-    ({"ssh": "user@box", "name": "b", "python": "python3.8", "projects_dir": "/data/p"},
-     {"name": "b", "ssh": "user@box", "python": "python3.8", "projects_dir": "/data/p"}),
+    ({"ssh": "user@box", "name": "b", "python": "/usr/bin/python3", "projects_dir": "/data/p"},
+     {"name": "b", "ssh": "user@box", "python": "/usr/bin/python3", "projects_dir": "/data/p"}),
     ({"ssh": "box", "name": ""}, {"name": "box", "ssh": "box", "python": "python3", "projects_dir": None}),
 ])
 def test_normalize_host(host, normalized):
@@ -25,7 +23,7 @@ def test_a_host_without_an_ssh_target_stops(host):
     "box",
     {"ssh": "box", "name": "b"},
     {"ssh": "box", "projects_dir": "/p"},
-    {"ssh": "box", "python": "python3.8"},
+    {"ssh": "box", "python": "/usr/bin/python3"},
     {"ssh": "box", "name": "b", "projects_dir": "/p", "python": "py"},
 ])
 def test_host_to_config_round_trips(config_form):
@@ -109,21 +107,6 @@ def test_a_host_that_hangs_times_out(report, write_config, fake_ssh):
     code, doc, _ = report("--no-local", "--no-warehouse")
     assert code == 2
     assert doc["machines"][0]["error"] == "timed out after 1s"
-
-
-def test_collector_runs_under_python_3_8(report, write_config, fake_ssh, remote_projects):
-    """The README promises remote machines need only Python 3.8."""
-    python38 = find_python38()
-    if python38 is None:
-        if os.environ.get("CLAUDE_USAGE_REQUIRE_PY38"):
-            pytest.fail("no Python 3.8 found, and CLAUDE_USAGE_REQUIRE_PY38 is set")
-        pytest.skip("no Python 3.8 found (uv python install 3.8)")
-    write_transcript(remote_projects, "a.jsonl", [record(msg_id="r1")])
-    write_config({"hosts": [{"ssh": "old", "python": python38, "projects_dir": str(remote_projects)}]})
-    code, doc, _ = report("--no-local", "--no-warehouse")
-    assert code == 0, doc["machines"][0]["error"]
-    assert doc["machines"][0]["python"].startswith("3.8.")
-    assert doc["totals"]["calls"] == 1
 
 
 def test_text_report_says_when_responses_were_on_two_machines(run, write_config, fake_ssh, projects_dir,

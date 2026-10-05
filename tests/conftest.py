@@ -10,8 +10,6 @@ import importlib.machinery
 import importlib.util
 import json
 import os
-import shutil
-import subprocess
 import time
 from pathlib import Path
 
@@ -204,15 +202,6 @@ def fake_ssh(monkeypatch, tmp_path):
         text = log.read_text()
         return [c.strip("\n").split("\n") for c in text.split("\n--\n") if c.strip("\n")]
     return calls
-
-
-def find_python38():
-    """A Python 3.8 interpreter, or None: uv's managed one first, then python3.8 on PATH."""
-    if shutil.which("uv"):
-        p = subprocess.run(["uv", "python", "find", "3.8"], capture_output=True, text=True)
-        if p.returncode == 0 and p.stdout.strip():
-            return p.stdout.strip()
-    return shutil.which("python3.8")
 
 
 @pytest.fixture

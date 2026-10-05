@@ -8,12 +8,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
-      - name: Install Python 3.8 for the remote collector test
-        run: uv python install 3.8
       - name: Run tests
-        run: uvx pytest -rxs
-        env:
-          CLAUDE_USAGE_REQUIRE_PY38: "1"
+        run: uvx --python ${{ matrix.python }} pytest -rxs

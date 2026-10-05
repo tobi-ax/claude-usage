@@ -15,7 +15,8 @@ the systemd timer below do it daily, and nothing ages out uncounted.
 
 ## Install
 
-Python 3.8 or newer is the only requirement; the script has no dependencies.
+Python 3 is the only requirement; the script has no dependencies. The tests
+run on Python 3.12 and 3.14, the versions on the machines it reads today.
 Clone the repo and put a symlink on your PATH:
 
 ```
@@ -224,7 +225,6 @@ installed, run them from the repo root:
 ```
 uvx pytest                 # the offline suite
 uvx pytest -m live         # also check Anthropic's live pricing page
-uv python install 3.8      # optional: lets the suite run the remote collector under Python 3.8
 ```
 
 Every test gets its own temporary `HOME` and data directory, so the suite
