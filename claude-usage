@@ -691,7 +691,7 @@ def run_setup(argv):
             return 0
     if not do_update:
         return 0
-    if run_update([]) != 0:
+    if run_update(["--config", path]) != 0:
         print("price update failed; {} was still written. Retry with 'claude-usage update'.".format(
             display_path(path)), file=sys.stderr)
         return 1

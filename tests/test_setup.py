@@ -113,11 +113,19 @@ def test_a_failed_price_update_still_keeps_the_config(setup, answers, monkeypatc
     assert saved(config_path) == {"hosts": []}
 
 
-@pytest.mark.xfail(reason="setup runs the price update with the default config path, so overrides in the "
-                          "config given with --config are not reported")
 def test_price_update_from_setup_reports_overrides_in_its_config(run, answers, tmp_path, pricing_page):
     path = tmp_path / "custom.json"
     path.write_text(json.dumps({"hosts": [], "pricing": {"claude-opus-5": [5.0, 25.0, 0.5]}}))
     answers("n", "y")
     _, out, _ = run("setup", "--config", str(path))
     assert "1 model is overridden in your config" in out
+
+
+def test_price_update_from_setup_ignores_overrides_in_the_default_config(run, answers, tmp_path, write_config,
+                                                                          pricing_page):
+    write_config({"pricing": {"claude-opus-5": [5.0, 25.0, 0.5]}})
+    path = tmp_path / "custom.json"
+    path.write_text(json.dumps({"hosts": []}))
+    answers("n", "y")
+    _, out, _ = run("setup", "--config", str(path))
+    assert "overridden in your config" not in out
