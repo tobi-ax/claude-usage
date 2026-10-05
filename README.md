@@ -194,9 +194,10 @@ with 1 hour TTL, cache read, output. Output includes thinking tokens.
 you go. On a Max or Team subscription this is not the bill; it is the
 comparable number. Rates: input and output per model; cache read per model;
 cache writes at 1.25x (5 min) and 2x (1 h) of the input rate; fast mode on
-Opus 5 and Opus 4.8 at 2x every rate. Server tool calls (web search) are not
-priced. A model missing from the table prints a warning and its tokens are
-excluded from the cost, never silently priced at zero. See "Prices" above for
+Opus 5.5, Opus 5 and Opus 4.8 at 2x every rate. Server tool calls (web search)
+are not priced. A model missing from the table prints a warning and its tokens
+are excluded from the cost, never silently priced at zero, and that includes a
+new point release of a model the table already has. See "Prices" above for
 where the rates come from and how to update them.
 
 **Model share** is shown both by tokens and by cost. Since cache reads
