@@ -95,8 +95,6 @@ def test_reimporting_the_same_cache_adds_nothing(run, stats_cache, warehouse_pat
     assert len(warehouse_path.read_text().splitlines()) == 1
 
 
-@pytest.mark.xfail(reason="README: 're-running the import replaces the earlier import'. The merge keeps the row "
-                          "with the larger output count, so a re-import with lower numbers keeps the old row.")
 def test_reimport_replaces_the_earlier_import(run, stats_cache, warehouse_path, config_path, projects_dir):
     day = [{"date": "2026-06-01", "tokensByModel": {"claude-opus-4-8": 1}}]
     import_into(run, config_path, projects_dir, stats_cache(cache({"claude-opus-4-8": usage(o=300)}, day)))
@@ -112,3 +110,27 @@ def test_text_report_marks_imported_rows_as_approximate(run, stats_cache, config
     _, out, _ = run("--config", str(config_path), "--projects-dir", str(projects_dir))
     assert ("  Approximate: 1 model-day rows imported from Claude's stats cache cover 2026-06-01 to 2026-06-01 "
             "on old-laptop (2.0k tokens).") in out
+
+
+def test_reimport_drops_model_days_the_new_cache_no_longer_has(run, stats_cache, warehouse_path, config_path,
+                                                                projects_dir):
+    two_days = [{"date": d, "tokensByModel": {"claude-opus-4-8": 1}} for d in ("2026-06-01", "2026-06-02")]
+    import_into(run, config_path, projects_dir, stats_cache(cache({"claude-opus-4-8": usage(o=300)}, two_days)))
+    import_into(run, config_path, projects_dir, stats_cache(cache({"claude-opus-4-8": usage(o=300)}, two_days[:1])))
+    assert [json.loads(l)["t"][:10] for l in warehouse_path.read_text().splitlines()] == ["2026-06-01"]
+
+
+def test_reimport_keeps_real_rows_and_other_machines_imports(run, stats_cache, warehouse_path, config_path,
+                                                             projects_dir):
+    real = {"id": "m1", "rq": "r1", "t": "2026-06-05T08:00:00.000Z", "m": "claude-opus-4-8", "i": 0, "o": 10,
+            "w5": 0, "w1": 0, "r": 0, "f": 0, "e": "cli", "s": "", "p": "", "mach": "old-laptop"}
+    warehouse_path.parent.mkdir(parents=True)
+    warehouse_path.write_text(json.dumps(real) + "\n")
+    day = [{"date": "2026-06-01", "tokensByModel": {"claude-opus-4-8": 1}}]
+    path = stats_cache(cache({"claude-opus-4-8": usage(o=300)}, day))
+    import_into(run, config_path, projects_dir, path, machine="other-box")
+    import_into(run, config_path, projects_dir, path)
+    import_into(run, config_path, projects_dir, path)
+    rows = [json.loads(l) for l in warehouse_path.read_text().splitlines()]
+    assert sorted((r["mach"], r["e"]) for r in rows) == [
+        ("old-laptop", "cli"), ("old-laptop", "stats-cache"), ("other-box", "stats-cache")]
