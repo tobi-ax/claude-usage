@@ -129,3 +129,31 @@ def test_price_update_from_setup_ignores_overrides_in_the_default_config(run, an
     answers("n", "y")
     _, out, _ = run("setup", "--config", str(path))
     assert "overridden in your config" not in out
+
+
+def test_retry_hint_names_a_non_default_config(run, answers, monkeypatch, tmp_path):
+    def fail(url, timeout):
+        raise urllib.error.URLError("offline")
+    monkeypatch.setattr(cu, "fetch_pricing_markdown", fail)
+    path = tmp_path / "my config.json"
+    answers("n")
+    _, _, err = run("setup", "--config", str(path))
+    assert "Retry with 'claude-usage update --config '{}''.".format(path) in err
+
+
+def test_retry_hint_for_the_default_config_has_no_flag(setup, answers, monkeypatch):
+    def fail(url, timeout):
+        raise urllib.error.URLError("offline")
+    monkeypatch.setattr(cu, "fetch_pricing_markdown", fail)
+    answers("n")
+    _, _, err = setup()
+    assert "Retry with 'claude-usage update'." in err
+
+
+def test_a_config_path_starting_with_a_dash_reaches_the_price_update(run, answers, pricing_page, tmp_path,
+                                                                     monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    answers("n")
+    code, _, _ = run("setup", "--config=-dash.json")
+    assert code == 0
+    assert (tmp_path / "-dash.json").exists()
