@@ -655,6 +655,13 @@ def build_setup_parser():
     return p
 
 
+def update_command(config_path):
+    """The `update` command line that reads config_path."""
+    if config_path == CONFIG_PATH:
+        return "claude-usage update"
+    return "claude-usage update --config {}".format(shlex.quote(config_path))
+
+
 def run_setup(argv):
     args = build_setup_parser().parse_args(argv)
     path = args.config
@@ -686,14 +693,14 @@ def run_setup(argv):
         try:
             do_update = ask_yes_no("Fetch current models and prices now?", True)
         except EOFError:
-            print("\nno input; skipping the price update. Run 'claude-usage update' to fetch prices later.",
-                  file=sys.stderr)
+            print("\nno input; skipping the price update. Run '{}' to fetch prices later.".format(
+                update_command(path)), file=sys.stderr)
             return 0
     if not do_update:
         return 0
-    if run_update([]) != 0:
-        print("price update failed; {} was still written. Retry with 'claude-usage update'.".format(
-            display_path(path)), file=sys.stderr)
+    if run_update(["--config=" + path]) != 0:
+        print("price update failed; {} was still written. Retry with '{}'.".format(
+            display_path(path), update_command(path)), file=sys.stderr)
         return 1
     return 0
 

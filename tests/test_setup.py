@@ -113,11 +113,55 @@ def test_a_failed_price_update_still_keeps_the_config(setup, answers, monkeypatc
     assert saved(config_path) == {"hosts": []}
 
 
-@pytest.mark.xfail(reason="setup runs the price update with the default config path, so overrides in the "
-                          "config given with --config are not reported")
 def test_price_update_from_setup_reports_overrides_in_its_config(run, answers, tmp_path, pricing_page):
     path = tmp_path / "custom.json"
     path.write_text(json.dumps({"hosts": [], "pricing": {"claude-opus-5": [5.0, 25.0, 0.5]}}))
     answers("n", "y")
     _, out, _ = run("setup", "--config", str(path))
     assert "1 model is overridden in your config" in out
+
+
+def test_price_update_from_setup_ignores_overrides_in_the_default_config(run, answers, tmp_path, write_config,
+                                                                          pricing_page):
+    write_config({"pricing": {"claude-opus-5": [5.0, 25.0, 0.5]}})
+    path = tmp_path / "custom.json"
+    path.write_text(json.dumps({"hosts": []}))
+    answers("n", "y")
+    _, out, _ = run("setup", "--config", str(path))
+    assert "overridden in your config" not in out
+
+
+def test_retry_hint_names_a_non_default_config(run, answers, monkeypatch, tmp_path):
+    def fail(url, timeout):
+        raise urllib.error.URLError("offline")
+    monkeypatch.setattr(cu, "fetch_pricing_markdown", fail)
+    path = tmp_path / "my config.json"
+    answers("n")
+    _, _, err = run("setup", "--config", str(path))
+    assert "Retry with 'claude-usage update --config '{}''.".format(path) in err
+
+
+def test_retry_hint_for_the_default_config_has_no_flag(setup, answers, monkeypatch):
+    def fail(url, timeout):
+        raise urllib.error.URLError("offline")
+    monkeypatch.setattr(cu, "fetch_pricing_markdown", fail)
+    answers("n")
+    _, _, err = setup()
+    assert "Retry with 'claude-usage update'." in err
+
+
+def test_a_config_path_starting_with_a_dash_reaches_the_price_update(run, answers, pricing_page, tmp_path,
+                                                                     monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    answers("n")
+    code, _, _ = run("setup", "--config=-dash.json")
+    assert code == 0
+    assert (tmp_path / "-dash.json").exists()
+
+
+def test_no_input_hint_names_a_non_default_config(run, answers, tmp_path):
+    path = tmp_path / "custom.json"
+    path.write_text(json.dumps({"hosts": []}))
+    answers("n")
+    _, _, err = run("setup", "--config", str(path))
+    assert "Run 'claude-usage update --config {}' to fetch prices later.".format(path) in err
