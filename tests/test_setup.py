@@ -157,3 +157,11 @@ def test_a_config_path_starting_with_a_dash_reaches_the_price_update(run, answer
     code, _, _ = run("setup", "--config=-dash.json")
     assert code == 0
     assert (tmp_path / "-dash.json").exists()
+
+
+def test_no_input_hint_names_a_non_default_config(run, answers, tmp_path):
+    path = tmp_path / "custom.json"
+    path.write_text(json.dumps({"hosts": []}))
+    answers("n")
+    _, _, err = run("setup", "--config", str(path))
+    assert "Run 'claude-usage update --config {}' to fetch prices later.".format(path) in err
