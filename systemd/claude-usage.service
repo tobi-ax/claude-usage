@@ -1,10 +1,10 @@
 [Unit]
-Description=Fold Claude Code usage from all machines into the claude-usage warehouse
+Description=Fold Claude Code usage from all machines into the claude-usage warehouse and refresh the HTML report
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/claude-usage --json
+ExecStart=%h/.local/bin/claude-usage --html
 StandardOutput=null
 StandardError=journal

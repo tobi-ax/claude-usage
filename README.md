@@ -188,10 +188,13 @@ systemctl --user list-timers claude-usage.timer
 journalctl --user -u claude-usage.service -n 20
 ```
 
-The service runs `~/.local/bin/claude-usage --json` once a day (with a random
-delay of up to 30 minutes, catching up after downtime) and discards the
-report. The warehouse update is the point. A failed host shows up in the
-journal.
+The service runs `~/.local/bin/claude-usage --html` once a day (with a random
+delay of up to 30 minutes, catching up after downtime). It updates the
+warehouse and rewrites `~/.local/share/claude-usage/report.html`, so that
+page always shows the data up to the last run; the text report is
+discarded. A failed host shows up in the journal and in the page. After
+pulling a change to the unit, copy it again and run `systemctl --user
+daemon-reload`.
 
 ### One-off import of Claude's own stats cache
 
