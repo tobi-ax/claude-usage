@@ -1327,7 +1327,6 @@ def render_json(ctx):
 
 HTML_TEMPLATE_NAME = "report.html"
 HTML_DATA_MARKER = "/*REPORT_DATA*/null"
-DAY_BUCKET_LIMIT = 62  # a period up to this many days is charted per day, a longer one per week
 RECENT_DAYS = 30
 
 
@@ -1351,30 +1350,10 @@ def entries(groups, name="name"):
             for k in by_cost_desc(groups)]
 
 
-def chart_buckets(days, day_of):
-    """(per_week, bucket key function, every bucket start from the first to the last) for the time chart.
-
-    days are the sorted local days with data, day_of gives a row's local day.
-    """
-    if not days:
-        return False, day_of, []
-    per_week = (as_date(days[-1]) - as_date(days[0])).days + 1 > DAY_BUCKET_LIMIT
-
-    def start_of(d):
-        return (as_date(d) - timedelta(days=as_date(d).weekday())).strftime("%Y-%m-%d") if per_week else d
-    start = {d: start_of(d) for d in days}
-
-    def key(r):
-        return start.get(day_of(r), "unknown")
-    first, last = as_date(start[days[0]]), as_date(start[days[-1]])
-    step = 7 if per_week else 1
-    starts = [(first + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(0, (last - first).days + 1, step)]
-    return per_week, key, starts
-
-
 def recent_costs(selected, pricing, days, day_of):
     """Cost of the last RECENT_DAYS days up to the newest day, and of the RECENT_DAYS before; None when the
-    data spans less than both windows. days and day_of as for chart_buckets()."""
+    data spans less than both windows. days are the sorted local days with data, day_of gives a row's
+    local day."""
     if not days or (as_date(days[-1]) - as_date(days[0])).days + 1 < 2 * RECENT_DAYS:
         return None
     cut = (as_date(days[-1]) - timedelta(days=RECENT_DAYS)).strftime("%Y-%m-%d")
@@ -1403,22 +1382,22 @@ def html_data(ctx):
     selected, pricing = ctx["selected"], ctx["pricing"]
     grand = summarize(selected, pricing)
     real = [r for r in selected if not is_imported(r)]
-    # Each row's local day, worked out once: the buckets and windows below read it many times.
+    # Each row's local day, worked out once: the series and windows below read it many times.
     local_day = {id(r): local_bucket("%Y-%m-%d")(r) for r in selected}
 
     def day_of(r):
         return local_day[id(r)]
     days = sorted(set(local_day.values()) - {"unknown"})
-    per_week, bucket, starts = chart_buckets(days, day_of)
-    in_bucket = {k: list(g) for k, g in groupby(sorted(selected, key=bucket), key=bucket)}
+    on_day = {d: list(g) for d, g in groupby(sorted(selected, key=day_of), key=day_of) if d != "unknown"}
     seen_machines = [m["name"] for m in ctx["machines"]]
     type_costs = cost_by_token_type(selected, pricing)
     repo = repo_key(real)
 
     def series(keyfn):
-        groups = group(selected, lambda r: (bucket(r), keyfn(r)), pricing)
-        return [{"bucket": b, "key": k, "calls": s["calls"], "tokens": total_tokens(s), "cost": round(s["cost"], 4)}
-                for (b, k), s in sorted(groups.items())]
+        """Cost per local day and key; the page adds days up into weeks or months to fit its width."""
+        groups = group([r for r in selected if day_of(r) != "unknown"], lambda r: (day_of(r), keyfn(r)), pricing)
+        return [{"day": d, "key": k, "calls": s["calls"], "tokens": total_tokens(s), "cost": round(s["cost"], 4)}
+                for (d, k), s in sorted(groups.items())]
 
     per_machine = group(real, lambda r: (repo(r), r["mach"]), pricing)
 
@@ -1442,9 +1421,7 @@ def html_data(ctx):
         "recent": recent_costs(selected, pricing, days, day_of),
         "token_types": [{"key": k, "label": TOKEN_LABELS[k], "tokens": grand[k], "cost": round(type_costs[k], 4)}
                         for k in TOKEN_KEYS],
-        "bucket": "week" if per_week else "day",
-        "buckets": [{"start": s, "empty": s not in in_bucket,
-                     "imported": s in in_bucket and all(is_imported(r) for r in in_bucket[s])} for s in starts],
+        "days": [{"day": d, "imported": all(is_imported(r) for r in on_day[d])} for d in days],
         "series": {"machine": series(lambda r: r["mach"]), "family": series(lambda r: model_family(r["m"]))},
         "machine_order": seen_machines + sorted({r["mach"] for r in selected} - set(seen_machines)),
         "machines": entries(group(selected, lambda r: r["mach"], pricing)),

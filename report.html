@@ -88,6 +88,8 @@
   .seg button + button { border-left: 1px solid var(--line); }
   .seg button[aria-pressed="true"] { background: var(--bg); color: var(--ink); font-weight: 600; }
   .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .seg button:disabled { color: var(--muted); opacity: 0.5; cursor: not-allowed; }
+  .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; }
   .table-wrap { overflow: auto; max-height: 30rem; }
   table { width: 100%; border-collapse: collapse; font-size: 1rem; font-variant-numeric: tabular-nums; }
   th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 600; text-align: right; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); }
@@ -110,9 +112,17 @@
   <section class="card" id="over-time">
     <div class="card-head">
       <h2 id="time-title">Estimated cost over time</h2>
-      <div class="seg" role="group" aria-label="Split bars by">
-        <button type="button" data-split="machine" aria-pressed="true">Machine</button>
-        <button type="button" data-split="family" aria-pressed="false">Model family</button>
+      <div class="controls">
+        <div class="seg" role="group" aria-label="One bar per">
+          <button type="button" data-size="auto" aria-pressed="true">Auto</button>
+          <button type="button" data-size="day" aria-pressed="false">Day</button>
+          <button type="button" data-size="week" aria-pressed="false">Week</button>
+          <button type="button" data-size="month" aria-pressed="false">Month</button>
+        </div>
+        <div class="seg" role="group" aria-label="Split bars by">
+          <button type="button" data-split="machine" aria-pressed="true">Machine</button>
+          <button type="button" data-split="family" aria-pressed="false">Model family</button>
+        </div>
       </div>
     </div>
     <p class="fine" id="time-note"></p>
@@ -322,18 +332,38 @@
     document.getElementById('notes').replaceChildren(...data.notes.map((line) => el('li', {}, line)));
   };
 
-  // ---- cost over time: stacked columns ------------------------------------
+  // ---- cost over time: stacked columns per day, week or month -----------------
+  const SIZES = ['day', 'week', 'month'];
+  const SIZE_NAMES = { day: 'Day', week: 'Week', month: 'Month' };
+  const MIN_STEP = 12; // px from one bar to the next; the automatic size is the finest that keeps this
+  const addDays = (day, n) => new Date(parseDay(day).getTime() + n * 864e5).toISOString().slice(0, 10);
+  const startOf = (day, size) => (size === 'day' ? day
+    : size === 'week' ? addDays(day, -((parseDay(day).getUTCDay() + 6) % 7))
+    : day.slice(0, 8) + '01');
+  const dayInfo = new Map(data.days.map((d) => [d.day, d]));
+  const allDays = data.days.length
+    ? Array.from({ length: Math.round((parseDay(data.days[data.days.length - 1].day) - parseDay(data.days[0].day)) / 864e5) + 1 },
+      (_, i) => addDays(data.days[0].day, i))
+    : [];
+  const bucketsOf = (size) => [...allDays.reduce((acc, day) => {
+    const start = startOf(day, size);
+    return acc.set(start, [...(acc.get(start) ?? []), day]);
+  }, new Map())].map(([start, days]) => {
+    const used = days.filter((d) => dayInfo.has(d));
+    return { start, empty: !used.length, imported: used.length > 0 && used.every((d) => dayInfo.get(d).imported) };
+  });
+  // bucket start -> key -> cost
+  const costsBy = (size, cells) => cells.reduce((acc, c) => {
+    const start = startOf(c.day, size);
+    const keys = acc.get(start) ?? new Map();
+    return acc.set(start, keys.set(c.key, (keys.get(c.key) ?? 0) + c.cost));
+  }, new Map());
+  const yearLabel = (day) => parseDay(day).toLocaleDateString('en', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+  const longMonth = (day) => parseDay(day).toLocaleDateString('en', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  let sizeChoice = 'auto';
+
   const drawTime = () => {
     document.querySelectorAll('[data-split]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.split === split)));
-    const perWeek = data.bucket === 'week';
-    document.getElementById('time-title').textContent = perWeek ? 'Estimated cost per week' : 'Estimated cost per day';
-    const imported = data.buckets.some((b) => b.imported);
-    const gaps = data.buckets.some((b) => b.empty);
-    document.getElementById('time-note').textContent = [
-      perWeek ? 'Weeks start on Monday.' : '',
-      imported ? `Shaded "Imported" ${perWeek ? 'weeks' : 'days'} hold only history imported from Claude's stats cache: tokens per model and day, no call counts.` : '',
-      gaps ? `"No records" marks ${perWeek ? 'weeks' : 'days'} with nothing in the data.` : '',
-    ].filter(Boolean).join(' ');
     const plot = plotFor('time-plot');
     const cells = data.series[split];
     const colorOf = split === 'machine' ? machineColor : familyColor;
@@ -343,33 +373,61 @@
       : [...FAMILIES, ...[...new Set(cells.map((c) => c.key))].filter((k) => !FAMILIES.includes(k)).sort()];
     const keys = order.filter((k) => cells.some((c) => c.key === k));
     legend('time-legend', keys.map((k) => [nameOf(k), colorOf(k)]));
-    if (!data.buckets.length) { emptyNote(plot, 'No usage in this period.'); return; }
+
+    // Which sizes fit: the y-axis labels of the monthly totals are the widest the chart can need.
+    const width = plot.clientWidth || 320;
+    const buckets = Object.fromEntries(SIZES.map((s) => [s, bucketsOf(s)]));
+    const costs = Object.fromEntries(SIZES.map((s) => [s, costsBy(s, cells)]));
+    const totalOf = (size, b) => sum([...(costs[size].get(b.start) ?? new Map()).values()], (v) => v);
+    const ticksFor = (size) => niceTicks(Math.max(...buckets[size].map((b) => totalOf(size, b)), 0), 5);
+    const widestLeft = textWidth(ticksFor('month').map(usdTick), 'num') + 10;
+    const fits = (size) => size === 'month' || buckets[size].length * MIN_STEP <= width - widestLeft - 4;
+    const auto = SIZES.find(fits);
+    const size = sizeChoice !== 'auto' && fits(sizeChoice) ? sizeChoice : auto;
+    document.querySelectorAll('[data-size]').forEach((b) => {
+      const s = b.dataset.size;
+      b.setAttribute('aria-pressed', String(s === 'auto' ? size === auto && (sizeChoice === 'auto' || !fits(sizeChoice)) : s === sizeChoice && fits(s)));
+      b.disabled = s !== 'auto' && !fits(s);
+      b.title = b.disabled ? 'Too many bars for this width' : '';
+      if (s === 'auto') b.textContent = `Auto: ${SIZE_NAMES[auto]}`;
+    });
+
+    const plural = { day: 'days', week: 'weeks', month: 'months' }[size];
+    document.getElementById('time-title').textContent = `Estimated cost per ${size}`;
+    const shown = buckets[size];
+    document.getElementById('time-note').textContent = [
+      size === 'week' ? 'Weeks start on Monday.' : '',
+      shown.some((b) => b.imported) ? `Shaded "Imported" ${plural} hold only history imported from Claude's stats cache: tokens per model and day, no call counts.` : '',
+      shown.some((b) => b.empty) ? `"No records" marks ${plural} with nothing in the data.` : '',
+    ].filter(Boolean).join(' ');
+    if (!shown.length) { emptyNote(plot, 'No usage in this period.'); return; }
 
     const today = data.generated_at.slice(0, 10);
-    const holdsToday = (b) => (perWeek ? b.start <= today && today < new Date(parseDay(b.start).getTime() + 7 * 864e5).toISOString().slice(0, 10) : b.start === today);
-    const byBucket = new Map(data.buckets.map((b) => [b.start, cells.filter((c) => c.bucket === b.start)]));
-    const totalOf = (b) => sum(byBucket.get(b.start), (c) => c.cost);
-    const width = plot.clientWidth || 320;
+    const holdsToday = (b) => startOf(today, size) === b.start;
     const height = 380;
     const top = 36;
     const bottom = height - 32;
-    const ticks = niceTicks(Math.max(...data.buckets.map(totalOf), 0), 5);
+    const ticks = ticksFor(size);
     const yMax = ticks[ticks.length - 1] || 1;
     const y = (v) => bottom - (v / yMax) * (bottom - top);
     const left = textWidth(ticks.map(usdTick), 'num') + 10;
-    const n = data.buckets.length;
+    const n = shown.length;
     const step = (width - left - 4) / n;
     const barW = Math.max(1, Math.min(28, step * 0.75));
     const xOf = (i) => left + i * step + (step - barW) / 2;
     const svg = newSvg(plot, width, height);
 
-    // shaded runs for imported buckets and buckets without records
-    const kindOf = (b) => (b.empty ? 'none' : b.imported ? 'imported' : 'real');
-    const runs = data.buckets.reduce((acc, b, i) => {
-      const kind = kindOf(b);
+    // shaded runs for imported buckets and buckets without records; an empty stretch shorter than a week
+    // (a weekend, a day off) is no gap in the data and joins the stretch before it
+    const joinRuns = (runs) => runs.reduce((acc, r) => {
       const last = acc[acc.length - 1];
-      return last && last.kind === kind && last.to === i - 1 ? [...acc.slice(0, -1), { ...last, to: i }] : [...acc, { kind, from: i, to: i }];
-    }, []).filter((r) => r.kind !== 'real');
+      return last && last.kind === r.kind ? [...acc.slice(0, -1), { ...last, to: r.to }] : [...acc, r];
+    }, []);
+    const daysPer = { day: 1, week: 7, month: 30 }[size];
+    const kindOf = (b) => (b.empty ? 'none' : b.imported ? 'imported' : 'real');
+    const rawRuns = joinRuns(shown.map((b, i) => ({ kind: kindOf(b), from: i, to: i })));
+    const runs = joinRuns(rawRuns.map((r, j) => (r.kind === 'none' && j > 0 && (r.to - r.from + 1) * daysPer < 7
+      ? { ...r, kind: rawRuns[j - 1].kind } : r))).filter((r) => r.kind !== 'real');
     runs.forEach((r) => {
       const x0 = left + r.from * step;
       const x1 = left + (r.to + 1) * step;
@@ -384,8 +442,10 @@
     });
 
     const tip = tooltip(plot);
-    data.buckets.forEach((b, i) => {
-      const parts = keys.map((k) => ({ k, v: sum(byBucket.get(b.start).filter((c) => c.key === k), (c) => c.cost) })).filter((p) => p.v > 0);
+    const headOf = { day: dayLabel, week: (d) => 'Week of ' + dayLabel(d), month: longMonth }[size];
+    shown.forEach((b, i) => {
+      const inBucket = costs[size].get(b.start) ?? new Map();
+      const parts = keys.map((k) => ({ k, v: inBucket.get(k) ?? 0 })).filter((p) => p.v > 0);
       const stacked = parts.reduce((acc, p) => [...acc, { ...p, y0: acc.length ? acc[acc.length - 1].y1 : 0, y1: (acc.length ? acc[acc.length - 1].y1 : 0) + p.v }], []);
       stacked.forEach((p, j) => {
         const yTop = y(p.y1);
@@ -393,24 +453,28 @@
         if (h <= 0) return;
         svg.append(svgEl('path', { d: j === stacked.length - 1 ? roundedTop(xOf(i), yTop, barW, h, 4) : square(xOf(i), yTop, barW, h), fill: colorOf(p.k) }));
       });
-      const head = (perWeek ? 'Week of ' : '') + dayLabel(b.start) + (holdsToday(b) ? ' (so far)' : '') + (b.imported ? ' · imported' : '');
-      const lines = b.empty ? [[null, 'No records', '']] : [...stacked.slice().reverse().map((p) => [colorOf(p.k), nameOf(p.k), usd(p.v)]), [null, 'Total', usd(totalOf(b))]];
+      const head = headOf(b.start) + (holdsToday(b) ? ' (so far)' : '') + (b.imported ? ' · imported' : '');
+      const lines = b.empty ? [[null, 'No records', '']] : [...stacked.slice().reverse().map((p) => [colorOf(p.k), nameOf(p.k), usd(p.v)]), [null, 'Total', usd(totalOf(size, b))]];
       const hit = svgEl('rect', { x: left + i * step, y: top - 30, width: step, height: bottom - top + 30, fill: 'transparent' });
       svg.append(hit);
       hover(hit, tip, head, lines);
     });
 
-    // x labels: per week the first bucket of each month, per day every Monday; skipped where they would collide
-    const labelled = data.buckets.map((b, i) => ({ b, i })).filter(({ b, i }) => (perWeek
-      ? i === 0 || b.start.slice(0, 7) !== data.buckets[i - 1].start.slice(0, 7)
-      : i === 0 || parseDay(b.start).getUTCDay() === 1));
-    const labelW = textWidth(['May 31']) + 8;
-    labelled.reduce((lastX, { b, i }) => {
-      const x = left + i * step + step / 2;
-      if (x - lastX < labelW) return lastX;
-      svg.append(svgEl('text', { x, y: height - 8, 'text-anchor': 'middle' }, perWeek ? monthLabel(b.start) : dayLabel(b.start)));
-      return x;
-    }, -Infinity);
+    // x labels: per day every Monday, per week each month's first week, per month every month, with the
+    // year on the first label and on January. Year labels are placed first; any label that would touch
+    // one already placed is left out.
+    const labelOf = (b, i) => {
+      if (size === 'day') return i === 0 || parseDay(b.start).getUTCDay() === 1 ? { text: dayLabel(b.start), year: false } : null;
+      const newMonth = i === 0 || b.start.slice(0, 7) !== shown[i - 1].start.slice(0, 7);
+      if (!newMonth) return null;
+      const year = i === 0 || b.start.slice(5, 7) === '01';
+      return { text: year ? yearLabel(b.start) : monthLabel(b.start), year };
+    };
+    const labels = shown.map((b, i) => ({ i, ...labelOf(b, i) })).filter((l) => l.text)
+      .map((l) => ({ ...l, x: left + l.i * step + step / 2, w: textWidth([l.text]) }));
+    [...labels.filter((l) => l.year), ...labels.filter((l) => !l.year)]
+      .reduce((placed, l) => (placed.some((p) => Math.abs(p.x - l.x) < (p.w + l.w) / 2 + 12) ? placed : [...placed, l]), [])
+      .forEach((l) => svg.append(svgEl('text', { x: l.x, y: height - 8, 'text-anchor': 'middle' }, l.text)));
   };
 
   // ---- horizontal bars --------------------------------------------------------
@@ -564,6 +628,7 @@
   };
 
   document.querySelectorAll('[data-split]').forEach((b) => b.addEventListener('click', () => { split = b.dataset.split; drawTime(); }));
+  document.querySelectorAll('[data-size]').forEach((b) => b.addEventListener('click', () => { sizeChoice = b.dataset.size; drawTime(); }));
   let lastWidth = 0;
   new ResizeObserver(() => {
     const w = document.getElementById('report').clientWidth;
