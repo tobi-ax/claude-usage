@@ -804,15 +804,36 @@ def price_key(model, pricing):
     return alias if alias in pricing else None
 
 
-def row_cost(r, pricing):
+def row_rates(r, pricing):
+    """(rates, fast-mode multiplier) for the row's model, or None when it has no price."""
     key = price_key(r["m"], pricing)
     if key is None:
         return None
-    rates = pricing[key]
-    mult = FAST_MODE_MULTIPLIER if r.get("f") and key in FAST_MODE_MODELS else 1.0
+    return pricing[key], FAST_MODE_MULTIPLIER if r.get("f") and key in FAST_MODE_MODELS else 1.0
+
+
+def row_cost(r, pricing):
+    priced = row_rates(r, pricing)
+    if priced is None:
+        return None
+    rates, mult = priced
     raw = (r["i"] * rates["input"] + r["o"] * rates["output"] + r["r"] * rates["cache_read"]
            + r["w5"] * rates["cache_write_5m"] + r["w1"] * rates["cache_write_1h"])
     return mult * raw / 1e6
+
+
+RATE_OF_TOKEN = {"i": "input", "w5": "cache_write_5m", "w1": "cache_write_1h", "r": "cache_read", "o": "output"}
+
+
+def cost_by_token_type(rows, pricing):
+    """Estimated cost per token key over rows; unpriced rows add nothing."""
+    def add(acc, r):
+        priced = row_rates(r, pricing)
+        if priced is None:
+            return acc
+        rates, mult = priced
+        return {k: acc[k] + mult * r[k] * rates[RATE_OF_TOKEN[k]] / 1e6 for k in TOKEN_KEYS}
+    return reduce(add, rows, {k: 0.0 for k in TOKEN_KEYS})
 
 
 def is_three_number_list(v):
@@ -1301,6 +1322,176 @@ def render_json(ctx):
 
 
 # --------------------------------------------------------------------------
+# HTML report: one self-contained page, drawn in the browser from embedded data
+# --------------------------------------------------------------------------
+
+HTML_TEMPLATE_NAME = "report.html"
+HTML_DATA_MARKER = "/*REPORT_DATA*/null"
+DAY_BUCKET_LIMIT = 62  # a period up to this many days is charted per day, a longer one per week
+RECENT_DAYS = 30
+
+
+def default_report_path():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "claude-usage", "report.html")
+
+
+def html_template_path():
+    """report.html next to the script; the symlink install resolves into the clone, where it lives."""
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), HTML_TEMPLATE_NAME)
+
+
+def as_date(day):
+    return datetime.strptime(day, "%Y-%m-%d")
+
+
+def entries(groups, name="name"):
+    """Summaries as a list of {name, calls, tokens, cost} objects, largest cost first."""
+    return [{name: k, "calls": groups[k]["calls"], "tokens": total_tokens(groups[k]), "cost": round(groups[k]["cost"], 4)}
+            for k in by_cost_desc(groups)]
+
+
+def chart_buckets(days, day_of):
+    """(per_week, bucket key function, every bucket start from the first to the last) for the time chart.
+
+    days are the sorted local days with data, day_of gives a row's local day.
+    """
+    if not days:
+        return False, day_of, []
+    per_week = (as_date(days[-1]) - as_date(days[0])).days + 1 > DAY_BUCKET_LIMIT
+
+    def start_of(d):
+        return (as_date(d) - timedelta(days=as_date(d).weekday())).strftime("%Y-%m-%d") if per_week else d
+    start = {d: start_of(d) for d in days}
+
+    def key(r):
+        return start.get(day_of(r), "unknown")
+    first, last = as_date(start[days[0]]), as_date(start[days[-1]])
+    step = 7 if per_week else 1
+    starts = [(first + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(0, (last - first).days + 1, step)]
+    return per_week, key, starts
+
+
+def recent_costs(selected, pricing, days, day_of):
+    """Cost of the last RECENT_DAYS days up to the newest day, and of the RECENT_DAYS before; None when the
+    data spans less than both windows. days and day_of as for chart_buckets()."""
+    if not days or (as_date(days[-1]) - as_date(days[0])).days + 1 < 2 * RECENT_DAYS:
+        return None
+    cut = (as_date(days[-1]) - timedelta(days=RECENT_DAYS)).strftime("%Y-%m-%d")
+    cut_before = (as_date(days[-1]) - timedelta(days=2 * RECENT_DAYS)).strftime("%Y-%m-%d")
+    cost = summarize([r for r in selected if cut < day_of(r) <= days[-1]], pricing)["cost"]
+    previous = summarize([r for r in selected if cut_before < day_of(r) <= cut], pricing)["cost"]
+    return {"days": RECENT_DAYS, "cost": round(cost, 4), "previous": round(previous, 4)}
+
+
+def header_notes(ctx):
+    """The text report's header lines, for the page's notes."""
+    selected, pricing = ctx["selected"], ctx["pricing"]
+    unpriced = sorted({r["m"] for r in selected if price_key(r["m"], pricing) is None})
+    lines = (machine_lines(ctx["machines"])
+             + [warehouse_line(ctx["warehouse"]),
+                pricing_source_line(ctx["fetched_pricing"], ctx["pricing_overrides"], ctx["pricing_builtin_only"])]
+             + (["{:,} responses were present on more than one machine and are counted once.".format(ctx["cross_dupes"])]
+                if ctx["cross_dupes"] else [])
+             + [l for l in [imported_line(selected, False)] if l]
+             + (["WARNING: no pricing for {} -> {} tokens excluded from the cost.".format(
+                 ", ".join(unpriced), fmt_tok(summarize(selected, pricing)["unpriced"], False))] if unpriced else []))
+    return [l.strip() for l in lines]
+
+
+def html_data(ctx):
+    selected, pricing = ctx["selected"], ctx["pricing"]
+    grand = summarize(selected, pricing)
+    real = [r for r in selected if not is_imported(r)]
+    # Each row's local day, worked out once: the buckets and windows below read it many times.
+    local_day = {id(r): local_bucket("%Y-%m-%d")(r) for r in selected}
+
+    def day_of(r):
+        return local_day[id(r)]
+    days = sorted(set(local_day.values()) - {"unknown"})
+    per_week, bucket, starts = chart_buckets(days, day_of)
+    in_bucket = {k: list(g) for k, g in groupby(sorted(selected, key=bucket), key=bucket)}
+    seen_machines = [m["name"] for m in ctx["machines"]]
+    type_costs = cost_by_token_type(selected, pricing)
+    repo = repo_key(real)
+
+    def series(keyfn):
+        groups = group(selected, lambda r: (bucket(r), keyfn(r)), pricing)
+        return [{"bucket": b, "key": k, "calls": s["calls"], "tokens": total_tokens(s), "cost": round(s["cost"], 4)}
+                for (b, k), s in sorted(groups.items())]
+
+    per_machine = group(real, lambda r: (repo(r), r["mach"]), pricing)
+
+    def repo_machines(name):
+        return {m: round(s["cost"], 4) for (n, m), s in per_machine.items() if n == name}
+    repos = entries(group(real, repo, pricing))
+    hour_of = {id(r): (weekday_key(r), local_bucket("%H")(r)) for r in real}
+    hours = group(real, lambda r: hour_of[id(r)], pricing)
+    return {
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "period": period_text(selected, ctx["since"], ctx["until"]),
+        "timezone": datetime.now().astimezone().strftime("%Z (UTC%z)"),
+        "notes": header_notes(ctx),
+        "machines_read": len(ctx["machines"]),
+        "failed": [m["name"] for m in ctx["machines"] if m["error"]],
+        "setup_done": ctx["setup_done"],
+        "totals": {"cost": round(grand["cost"], 4), "calls": grand["calls"], "tokens": total_tokens(grand),
+                   "unpriced_tokens": grand["unpriced"], "first_day": days[0] if days else None,
+                   "last_day": days[-1] if days else None, "days_with_usage": len(days),
+                   "imported_rows": len(selected) - len(real)},
+        "recent": recent_costs(selected, pricing, days, day_of),
+        "token_types": [{"key": k, "label": TOKEN_LABELS[k], "tokens": grand[k], "cost": round(type_costs[k], 4)}
+                        for k in TOKEN_KEYS],
+        "bucket": "week" if per_week else "day",
+        "buckets": [{"start": s, "empty": s not in in_bucket,
+                     "imported": s in in_bucket and all(is_imported(r) for r in in_bucket[s])} for s in starts],
+        "series": {"machine": series(lambda r: r["mach"]), "family": series(lambda r: model_family(r["m"]))},
+        "machine_order": seen_machines + sorted({r["mach"] for r in selected} - set(seen_machines)),
+        "machines": entries(group(selected, lambda r: r["mach"], pricing)),
+        "models": [{**e, "family": model_family(e["name"].replace(" (fast)", ""))}
+                   for e in entries(group(selected, model_label, pricing))],
+        "entrypoints": entries(group(selected, lambda r: r["e"], pricing)),
+        "repos": [{**e, "machines": repo_machines(e["name"])} for e in repos],
+        "hours": [{"weekday": int(w.split()[0]), "hour": int(h), "calls": s["calls"], "cost": round(s["cost"], 4)}
+                  for (w, h), s in sorted(hours.items()) if w != "unknown" and h != "unknown"],
+    }
+
+
+def render_html(ctx, template):
+    if template.count(HTML_DATA_MARKER) != 1:
+        raise SystemExit("HTML template {} does not hold the data marker {} exactly once".format(
+            html_template_path(), HTML_DATA_MARKER))
+    # "<" escaped so no value (a project path, say) can end the <script> element the data sits in.
+    payload = json.dumps(html_data(ctx), separators=(",", ":")).replace("<", "\\u003c")
+    return template.replace(HTML_DATA_MARKER, payload)
+
+
+def write_text_atomic(path, text):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        os.remove(tmp)
+        raise
+
+
+def write_html(path, ctx):
+    template_path = html_template_path()
+    try:
+        with open(template_path, encoding="utf-8") as fh:
+            template = fh.read()
+    except OSError as e:
+        raise SystemExit("cannot read the HTML template {}: {}".format(template_path, e.strerror or e))
+    target = os.path.abspath(os.path.expanduser(path))
+    write_text_atomic(target, render_html(ctx, template))
+    return target
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -1347,6 +1538,9 @@ def build_parser():
     p.add_argument("--import-machine", metavar="NAME", help="machine name for the imported rows (default: this host)")
     p.add_argument("--exact", action="store_true", help="print exact token counts instead of k/M")
     p.add_argument("--json", action="store_true", help="print JSON instead of the text report")
+    p.add_argument("--html", metavar="PATH", nargs="?", const=default_report_path(),
+                   help="also write the report as a self-contained HTML page with charts "
+                        "(default path: %s)" % display_path(default_report_path()))
     p.add_argument("--collect", action="store_true", help=argparse.SUPPRESS)
     return p
 
@@ -1400,6 +1594,10 @@ def main(argv):
         "pricing_builtin_only": pricing_builtin_only, "setup_done": setup_done,
     }
     print((render_json if args.json else render_report)(ctx))
+    if args.html:
+        written = write_html(args.html, ctx)
+        sys.stdout.flush()
+        print("HTML report written to {}".format(display_path(written)), file=sys.stderr)
     failed = [m["name"] for m in machines if m["error"]]
     if failed:
         sys.stdout.flush()
