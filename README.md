@@ -37,8 +37,11 @@ snapshot see "Daily snapshot with systemd" below.
 claude-usage                      # everything, all machines
 claude-usage --last 7d            # last 7 days (also 4w, 3m; m = 30 days)
 claude-usage --since 2026-09-01 --until 2026-09-15
-claude-usage --by day             # add a per-day table (also week, month)
+claude-usage --by day             # add a per-day table (also week, month, weekday, hour)
 claude-usage --by entrypoint      # T3 (sdk-ts) vs desktop vs terminal (cli)
+claude-usage --by repo            # per repository, worktrees included (see below)
+claude-usage --by family          # opus, sonnet, haiku, ...
+claude-usage --by week,machine    # two names: one row per week and machine
 claude-usage --by project --top 10
 claude-usage --by session --top 10
 claude-usage --exact              # full token counts instead of 1.2M
@@ -49,6 +52,15 @@ claude-usage --no-warehouse       # live scans only, do not read or update the w
 claude-usage setup                # wizard: add/edit/remove SSH hosts, fetch current prices
 claude-usage update               # fetch current model prices from Anthropic
 ```
+
+`--by` takes `day`, `week`, `month`, `weekday`, `hour`, `machine`, `model`,
+`family`, `entrypoint`, `project`, `repo` or `session`, and is repeatable.
+Two of them joined by a comma, such as `week,machine` or `repo,family`, make
+one table with a row per combination; `session` stands alone. A breakdown
+that starts with a time name lists its rows in time order. Any other lists
+them by cost, and `--top` limits it to that many rows, or for a pair to that
+many values of the first name. In `--json` a pair nests, for example
+`"by": {"week,machine": {"2026-W40": {"artemis": {...}}}}`.
 
 Exit code 2 means at least one machine could not be read. The report still
 prints, with that machine marked FAILED in the header, so a missing machine
@@ -204,8 +216,29 @@ where the rates come from and how to update them.
 **Model share** is shown both by tokens and by cost. Since cache reads
 dominate the token count, the two differ a lot.
 
-**Time** filters and day/week/month buckets use the local timezone of the
-machine running the report.
+**Time** filters and the day, week, month, weekday and hour buckets use the
+local timezone of the machine running the report. Rows imported from the
+stats cache know their day but not their time, so their hour is `unknown`.
+
+**Repository** is a guess from the project paths alone, since a transcript
+records only the working directory. A T3 Code worktree
+(`~/.t3/worktrees/<repo>/<id>`), a Claude Code worktree
+(`<repo>/.claude/worktrees/<name>`) and anything under `node_modules` count
+toward their repository. A directory that holds two or more project
+directories, such as `~/Code`, is a workspace rather than a repository and
+keeps its full path, and so does a directory that holds such a workspace. A
+subdirectory belongs to the outermost project directory above it that is not
+a workspace (`~/Code/mono/services/api` is `mono`). A name like
+`app-fix-login` counts as `app` when `app` is a repository too, since that is
+how hand-made worktrees are usually named. Paths under a temp dir share one
+row, and rows without a path, such as the imported history, are `unknown`.
+`--by project` shows the raw paths.
+
+The guess goes wrong in two known ways. A repository with sessions started
+directly in two of its subdirectories (`mono/frontend` and `mono/services`)
+looks like a workspace, so those subdirectories become rows of their own. A
+separate repository whose name starts with another one's name and a dash
+(`platform-api` next to `platform`) is folded into that one.
 
 ## What it cannot see
 

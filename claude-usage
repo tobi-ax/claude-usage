@@ -879,13 +879,130 @@ def model_label(r):
     return r["m"] + (" (fast)" if r.get("f") else "")
 
 
+def model_family(model):
+    """claude-opus-5-5 -> opus, claude-haiku-4-5-20251001 -> haiku, claude-3-5-haiku -> haiku."""
+    m = re.match(r"claude-(?:\d+(?:-\d+)*-)?([a-z]+)", model)
+    return m.group(1) if m else model
+
+
+WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def clock_bucket(keyfn):
+    """keyfn for real rows; an imported row only knows its day, so its time of day is "unknown"."""
+    return lambda r: "unknown" if is_imported(r) else keyfn(r)
+
+
+def weekday_key(r):
+    dt = parse_ts(r["t"])
+    if not dt:
+        return "unknown"
+    n = int(dt.astimezone().strftime("%u"))
+    return "{} {}".format(n, WEEKDAY_NAMES[n - 1])
+
+
+T3_WORKTREE = re.compile(r"/\.t3/worktrees/([^/]+)(?:/|$)")
+TEMP_DIR = re.compile(r"^(?:/tmp|/private/tmp|/var/folders|/private/var/folders)(?:/|$)")
+TEMP_LABEL = "(temp dirs)"
+
+
+def checkout_path(p):
+    """A project path with whatever sits below its checkout cut off.
+
+    A dependency inside node_modules belongs to the project that installed it,
+    and a Claude Code worktree under <repo>/.claude/worktrees is a checkout of
+    <repo>.
+    """
+    p = re.sub(r"/node_modules(?:/.*)?$", "", p.rstrip("/"))
+    return re.sub(r"/\.claude/worktrees(?:/.*)?$", "", p) or "/"
+
+
+def is_under(path, ancestor):
+    return path.startswith(ancestor.rstrip("/") + "/")
+
+
+def repo_labels(paths):
+    """Project path -> repository label, guessed from the set of project paths alone.
+
+    - <anything>/.t3/worktrees/<repo>/<id> (a T3 Code worktree) is <repo>.
+    - Paths under a temp dir share one label.
+    - A path with at least two other project paths directly inside it is a
+      workspace (~/Code holding one checkout per repo), and so is every path
+      that holds a workspace (~ holding ~/Code). A workspace is not a
+      repository and keeps its full path as the label.
+    - Every other path belongs to its outermost ancestor-or-self that is a
+      project path and not a workspace: ~/Code/mono/services/x is mono when
+      ~/Code/mono is a project path too.
+    - That directory is a repository when it sits directly in a workspace or
+      in none at all, and its name is the label. Deeper inside a workspace
+      (~/.local/share/x when ~ is a workspace) it is not, and keeps its full
+      path as the label.
+    - A name of the form <repo>-<suffix>, where <repo> is another label, is
+      a sibling checkout of <repo> (a hand-made worktree) and takes its label.
+    """
+    cut = {p: checkout_path(p) for p in paths}
+    t3 = {p: m.group(1) for p, c in cut.items() for m in [T3_WORKTREE.search(c)] if m}
+    temp = {p for p, c in cut.items() if p not in t3 and TEMP_DIR.match(c)}
+    candidates = {c for p, c in cut.items() if p not in t3 and p not in temp}
+    parents = [os.path.dirname(c) for c in candidates if os.path.dirname(c) != c]
+    holders = {c for c in candidates if parents.count(c) >= 2}
+    workspaces = {c for c in candidates if any(h == c or is_under(h, c) for h in holders)}
+    repos = candidates - workspaces
+
+    def root(c):
+        return min((a for a in repos if c == a or is_under(c, a)), key=len, default=c)
+
+    def is_repo(r):
+        return r not in workspaces and (os.path.dirname(r) in workspaces
+                                        or not any(is_under(r, w) for w in workspaces))
+    roots = {p: root(c) for p, c in cut.items() if p not in t3 and p not in temp}
+    names = {os.path.basename(r) for r in roots.values() if is_repo(r)} | set(t3.values())
+
+    def fold(name):
+        return max((n for n in names if name.startswith(n + "-")), key=len, default=name)
+    return {
+        **{p: fold(n) for p, n in t3.items()},
+        **{p: TEMP_LABEL for p in temp},
+        **{p: fold(os.path.basename(r) or r) if is_repo(r) else r for p, r in roots.items()},
+    }
+
+
+def repo_key(rows):
+    labels = repo_labels({r["p"] for r in rows if r["p"]})
+    return lambda r: labels.get(r["p"], "unknown")
+
+
 GROUPINGS = {
     "day": ("Day", local_bucket("%Y-%m-%d")),
     "week": ("Week", local_bucket("%G-W%V")),
     "month": ("Month", local_bucket("%Y-%m")),
+    "weekday": ("Weekday", weekday_key),
+    "hour": ("Hour", clock_bucket(local_bucket("%H"))),
+    "machine": ("Machine", lambda r: r["mach"]),
+    "model": ("Model", model_label),
+    "family": ("Family", lambda r: model_family(r["m"])),
     "entrypoint": ("Entrypoint", lambda r: r["e"]),
     "project": ("Project (cwd)", lambda r: r["p"] or "unknown"),
 }
+TIME_GROUPINGS = {"day", "week", "month", "weekday", "hour"}
+BY_NAMES = sorted(list(GROUPINGS) + ["repo"])
+
+
+def grouping(name, rows):
+    """(header, key function) for a --by name. The repo key depends on every project path in rows."""
+    return ("Repository", repo_key(rows)) if name == "repo" else GROUPINGS[name]
+
+
+def parse_by(value):
+    """A --by value: one breakdown name, "session", or two names joined by a comma."""
+    parts = tuple(p.strip() for p in value.split(","))
+    if parts == ("session",):
+        return parts
+    if len(parts) > 2 or len(set(parts)) != len(parts) or any(p not in BY_NAMES for p in parts):
+        raise argparse.ArgumentTypeError(
+            "expected one of {} and session, or two of the first joined by a comma (e.g. week,machine); "
+            "got {!r}".format(", ".join(BY_NAMES), value))
+    return parts
 
 
 # --------------------------------------------------------------------------
@@ -941,20 +1058,21 @@ def fmt_pct(part, whole):
     return "{:.1f}%".format(100.0 * part / whole) if whole else "-"
 
 
-def render_table(headers, rows, indent="  "):
+def render_table(headers, rows, indent="  ", labels=1):
+    """Aligned columns; the first `labels` columns are left-aligned, the rest right-aligned."""
     if not rows:
         return indent + "(nothing)"
     widths = [max(len(str(c)) for c in col) for col in zip(headers, *rows)]
 
     def line(cells):
         return indent + "  ".join(
-            str(c).ljust(w) if i == 0 else str(c).rjust(w) for i, (c, w) in enumerate(zip(cells, widths))
+            str(c).ljust(w) if i < labels else str(c).rjust(w) for i, (c, w) in enumerate(zip(cells, widths))
         ).rstrip()
     return "\n".join([line(headers), indent + "  ".join("-" * w for w in widths)] + [line(r) for r in rows])
 
 
-def usage_row(label, s, exact, grand=None):
-    base = [label, "{:,}".format(s["calls"]), fmt_tok(s["i"], exact), fmt_tok(s["w5"] + s["w1"], exact),
+def usage_row(labels, s, exact, grand=None):
+    base = [*labels, "{:,}".format(s["calls"]), fmt_tok(s["i"], exact), fmt_tok(s["w5"] + s["w1"], exact),
             fmt_tok(s["r"], exact), fmt_tok(s["o"], exact), fmt_tok(total_tokens(s), exact), fmt_usd(s["cost"])]
     share = [fmt_pct(total_tokens(s), total_tokens(grand)), fmt_pct(s["cost"], grand["cost"])] if grand else []
     return base + share
@@ -965,14 +1083,58 @@ SHARE_HEADERS = ["Tokens %", "Cost %"]
 
 
 def usage_table(first_header, groups, exact, grand=None, order=None, limit=None):
+    """One row per group; a tuple key (a pair breakdown) fills one label column per element."""
     keys = order(groups) if order else sorted(groups)
     keys = keys[:limit] if limit else keys
-    headers = [first_header] + USAGE_HEADERS + (SHARE_HEADERS if grand else [])
-    return render_table(headers, [usage_row(k, groups[k], exact, grand) for k in keys])
+    label_headers = list(first_header) if isinstance(first_header, tuple) else [first_header]
+    headers = label_headers + USAGE_HEADERS + (SHARE_HEADERS if grand else [])
+    rows = [usage_row(k if isinstance(k, tuple) else (k,), groups[k], exact, grand) for k in keys]
+    return render_table(headers, rows, labels=len(label_headers))
 
 
 def by_cost_desc(groups):
     return sorted(groups, key=lambda k: (-groups[k]["cost"], -total_tokens(groups[k]), k))
+
+
+def pairs_by_cost_desc(groups):
+    """Pair keys ordered by their first element's total cost, then by their own cost."""
+    firsts = reduce(lambda acc, k: {**acc, k[0]: acc.get(k[0], 0.0) + groups[k]["cost"]}, groups, {})
+    return sorted(groups, key=lambda k: (-firsts[k[0]], k[0], -groups[k]["cost"], -total_tokens(groups[k]), k))
+
+
+def first_elements(keys, limit):
+    """keys, kept only where the first element is among the first `limit` distinct ones."""
+    firsts = list(dict.fromkeys(k[0] for k in keys))
+    kept = firsts[:limit] if limit else firsts
+    return [k for k in keys if k[0] in kept]
+
+
+def breakdown_groups(by, rows, pricing):
+    """(headers, groups) for a --by value; a pair has tuple headers and tuple keys."""
+    specs = [grouping(name, rows) for name in by]
+    headers = tuple(h for h, _ in specs)
+    keyfns = [k for _, k in specs]
+    keyfn = keyfns[0] if len(keyfns) == 1 else (lambda r: tuple(k(r) for k in keyfns))
+    return (headers[0] if len(headers) == 1 else headers), group(rows, keyfn, pricing)
+
+
+def breakdown_table(by, rows, pricing, args, grand):
+    """The text table for one --by value; time breakdowns run in time order, the rest by cost."""
+    header, groups = breakdown_groups(by, rows, pricing)
+    if by[0] in TIME_GROUPINGS:
+        return usage_table(header, groups, args.exact)
+    if len(by) == 1:
+        return usage_table(header, groups, args.exact, grand, by_cost_desc, args.top)
+    keys = first_elements(pairs_by_cost_desc(groups), args.top)
+    return usage_table(header, groups, args.exact, grand, lambda _: keys)
+
+
+def breakdown_json(by, rows, pricing):
+    """A pair nests: {first: {second: summary}}."""
+    _, groups = breakdown_groups(by, rows, pricing)
+    if len(by) == 1:
+        return {k: summary_json(v) for k, v in groups.items()}
+    return reduce(lambda acc, k: {**acc, k[0]: {**acc.get(k[0], {}), k[1]: summary_json(groups[k])}}, sorted(groups), {})
 
 
 def session_table(rows, pricing, exact, top):
@@ -1095,19 +1257,14 @@ def render_report(ctx):
     out.append("")
     out.append("By machine")
     out.append(usage_table("Machine", group(selected, lambda r: r["mach"], pricing), args.exact, grand, by_cost_desc))
-    for name in args.by:
+    for by in args.by:
         out.append("")
-        if name == "session":
+        if by == ("session",):
             out.append("Top {} sessions by cost".format(args.top))
             out.append(session_table(selected, pricing, args.exact, args.top))
         else:
-            header, keyfn = GROUPINGS[name]
-            time_based = name in ("day", "week", "month")
-            out.append("By {}".format(name))
-            out.append(usage_table(header, group(selected, keyfn, pricing), args.exact,
-                                   None if time_based else grand,
-                                   None if time_based else by_cost_desc,
-                                   None if time_based else args.top))
+            out.append("By {}".format(" and ".join(by)))
+            out.append(breakdown_table(by, selected, pricing, args, grand))
     return "\n".join(out)
 
 
@@ -1135,9 +1292,10 @@ def render_json(ctx):
         "unpriced_models": sorted({r["m"] for r in selected if price_key(r["m"], pricing) is None}),
         "by_model": {k: summary_json(v) for k, v in group(selected, model_label, pricing).items()},
         "by_machine": {k: summary_json(v) for k, v in group(selected, lambda r: r["mach"], pricing).items()},
-        "by": {name: {("/".join(k) if isinstance(k, tuple) else k): summary_json(v) for k, v in
-                      (group(selected, lambda r: (r["mach"], r["s"]), pricing) if name == "session"
-                       else group(selected, GROUPINGS[name][1], pricing)).items()} for name in args.by},
+        "by": {",".join(by): ({"/".join(k): summary_json(v)
+                               for k, v in group(selected, lambda r: (r["mach"], r["s"]), pricing).items()}
+                              if by == ("session",) else breakdown_json(by, selected, pricing))
+               for by in args.by},
     }
     return json.dumps(doc, indent=2)
 
@@ -1166,9 +1324,12 @@ def build_parser():
     p.add_argument("--since", metavar="YYYY-MM-DD", help="first day to include (local time)")
     p.add_argument("--until", metavar="YYYY-MM-DD", help="last day to include (local time, inclusive)")
     p.add_argument("--last", metavar="N{d,w,m}", help="only the last N days/weeks/months (m = 30 days), e.g. 7d")
-    p.add_argument("--by", action="append", default=[], choices=sorted(GROUPINGS) + ["session"],
-                   help="add a breakdown; repeatable")
-    p.add_argument("--top", type=int, default=15, help="rows to show for project/session/entrypoint breakdowns")
+    p.add_argument("--by", action="append", default=[], type=parse_by, metavar="NAME[,NAME]",
+                   help="add a breakdown; repeatable. NAME is one of {}, or session; two names joined by a "
+                        "comma break down by both, e.g. week,machine".format(", ".join(BY_NAMES)))
+    p.add_argument("--top", type=int, default=15,
+                   help="rows (for a pair: values of the first name) to show in breakdowns that are not "
+                        "in time order")
     p.add_argument("--host", action="append", metavar="SSH_HOST",
                    help="SSH host to include; repeatable; replaces the config's host list")
     p.add_argument("--no-local", action="store_true", help="skip this machine")
