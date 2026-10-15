@@ -25,7 +25,8 @@ ln -s ~/Code/claude-usage/claude-usage ~/.local/bin/claude-usage
 claude-usage setup
 ```
 
-The symlink points into the clone, so `git pull` updates the installed tool.
+The symlink points into the clone, so `git pull` updates the installed tool,
+and the tool finds `report.html` for `--html` next to the file it resolves to.
 `setup` asks for the SSH hosts to include and fetches current prices; without
 it the tool still reports this machine. Remote machines need `python3` on the
 PATH of a non-interactive SSH shell and nothing else. For the daily warehouse
@@ -46,6 +47,8 @@ claude-usage --by project --top 10
 claude-usage --by session --top 10
 claude-usage --exact              # full token counts instead of 1.2M
 claude-usage --json               # machine-readable, same content
+claude-usage --html               # also write a page with charts (default path below)
+claude-usage --last 30d --html ~/usage.html
 claude-usage --no-remote          # this machine only
 claude-usage --host box-a --host box-b   # ad-hoc host list instead of the config
 claude-usage --no-warehouse       # live scans only, do not read or update the warehouse
@@ -61,6 +64,25 @@ that starts with a time name lists its rows in time order. Any other lists
 them by cost, and `--top` limits it to that many rows, or for a pair to that
 many values of the first name. In `--json` a pair nests, for example
 `"by": {"week,machine": {"2026-W40": {"artemis": {...}}}}`.
+
+## HTML report
+
+`--html` also writes the report as one HTML page with charts, next to the
+text or JSON output, which stay as they are. Without a path it goes to
+`~/.local/share/claude-usage/report.html` (or `$XDG_DATA_HOME/claude-usage/`).
+The page is self-contained: the data sits in the file and the charts are
+drawn by plain JavaScript in it, with no network access, so it opens from
+disk and can be mailed around. It follows the browser's light or dark mode.
+
+It shows the totals, the estimated cost per day (per week for periods
+longer than 62 days) split by machine or by model family, token types by
+share of tokens and of cost, cost by model, machine, client and repository,
+a weekday-by-hour heatmap, and the header lines of the text report.
+`--last`, `--since` and `--until` apply as usual.
+
+The page is built from `report.html`, which has to stay next to the
+script. The symlink install keeps it there, since the symlink resolves into
+the clone. Remote machines never need it.
 
 Exit code 2 means at least one machine could not be read. The report still
 prints, with that machine marked FAILED in the header, so a missing machine

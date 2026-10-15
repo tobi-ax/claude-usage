@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Code usage</title>
+<!--
+  Template for `claude-usage --html`. The script replaces the data marker in
+  the <script id="report-data"> element below with the report as JSON; the
+  page draws everything from that, with no network access.
+-->
+<style>
+  /* Layout: one column of cards; tiles and the smaller charts wrap into a grid as width allows. */
+  :root {
+    color-scheme: light;
+    --bg: #f9f9f7;
+    --panel: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #6f6e69;
+    --line: #e1e0d9;
+    --axis: #c3c2b7;
+    --accent: #3d4f73;
+    --track: #c3c2b7;
+    --critical: #d03b3b;
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+    --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+    --other: #a3a29b;
+    --radius: 8px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #0d0d0d;
+      --panel: #1a1a19;
+      --ink: #f0efec;
+      --ink-2: #c3c2b7;
+      --muted: #9a9890;
+      --line: #2c2c2a;
+      --axis: #383835;
+      --accent: #a9b8d8;
+      --track: #4a4a46;
+      --critical: #e66767;
+      --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+      --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+      --other: #6b6a64;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 16px; line-height: 1.5; }
+  main { max-width: 84rem; margin: 0 auto; padding: 2rem max(16px, env(safe-area-inset-right, 0px)) 3rem max(16px, env(safe-area-inset-left, 0px)); display: flex; flex-direction: column; gap: 1.5rem; }
+  h1 { font-size: 1.9rem; font-weight: 600; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+  h2 { font-size: 1.15rem; font-weight: 600; margin: 0; }
+  h3 { font-size: 1rem; font-weight: 600; margin: 0; }
+  .sub { color: var(--ink-2); margin: 0.25rem 0 0; }
+  .fine { color: var(--muted); font-size: 0.85rem; margin: 0; }
+  .notes { margin: 0; padding: 0; list-style: none; font-family: var(--mono); font-size: 0.8rem; color: var(--ink-2); overflow-x: auto; }
+  .notes li { white-space: pre; }
+  .alert { display: flex; gap: 0.5rem; align-items: baseline; border: 1px solid var(--critical); border-radius: var(--radius); padding: 0.6rem 0.8rem; background: var(--panel); }
+  .alert strong { color: var(--critical); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr)); gap: 1rem; }
+  .tile, .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 1.1rem 1.2rem; min-width: 0; }
+  .tile { display: flex; flex-direction: column; gap: 0.15rem; }
+  .tile .label { font-size: 0.85rem; color: var(--muted); }
+  .tile .value { font-size: 2rem; font-weight: 600; line-height: 1.2; }
+  .tile .detail { font-size: 0.85rem; color: var(--ink-2); }
+  .card { display: flex; flex-direction: column; gap: 0.6rem; }
+  .card-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 26rem), 1fr)); gap: 1rem; }
+  .legend { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; font-size: 0.85rem; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; display: inline-block; }
+  .plot { position: relative; min-width: 0; }
+  .plot svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .plot text { font-family: var(--font); font-size: 12px; fill: var(--muted); }
+  .plot text.value { fill: var(--ink); font-variant-numeric: tabular-nums; }
+  .plot text.num { font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); font-size: 0.9rem; padding: 1rem 0; }
+  .tip { position: absolute; top: 0; left: 0; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12); padding: 0.4rem 0.6rem; font-size: 0.8rem; line-height: 1.5; white-space: nowrap; z-index: 2; }
+  .tip .head { color: var(--ink-2); }
+  .tip .row { display: flex; align-items: center; gap: 0.4rem; font-variant-numeric: tabular-nums; }
+  .tip .row b { font-weight: 600; margin-left: auto; padding-left: 0.8rem; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .seg button { font: inherit; font-size: 0.85rem; color: var(--ink-2); background: transparent; border: 0; padding: 0.25rem 0.7rem; cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button[aria-pressed="true"] { background: var(--bg); color: var(--ink); font-weight: 600; }
+  .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .table-wrap { overflow: auto; max-height: 30rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.875rem; font-variant-numeric: tabular-nums; }
+  th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 600; text-align: right; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); }
+  td { text-align: right; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  td:first-child { font-family: var(--mono); font-size: 0.8rem; }
+  @media (max-width: 40rem) { .narrow-hide { display: none; } }
+</style>
+</head>
+<body>
+<main id="report">
+  <header>
+    <h1>Claude Code usage</h1>
+    <p class="sub" id="period"></p>
+    <p class="fine">Estimated cost at Anthropic API list prices: what these tokens would cost pay-as-you-go. On a subscription it is not the bill.</p>
+  </header>
+  <div id="alerts"></div>
+  <section class="tiles" id="tiles"></section>
+
+  <section class="card" id="over-time">
+    <div class="card-head">
+      <h2 id="time-title">Estimated cost over time</h2>
+      <div class="seg" role="group" aria-label="Split bars by">
+        <button type="button" data-split="machine" aria-pressed="true">Machine</button>
+        <button type="button" data-split="family" aria-pressed="false">Model family</button>
+      </div>
+    </div>
+    <p class="fine" id="time-note"></p>
+    <div class="legend" id="time-legend"></div>
+    <div class="plot" id="time-plot"></div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Token types</h2>
+      <p class="fine">Share of all tokens next to share of the estimated cost.</p>
+      <div class="legend" id="token-legend"></div>
+      <div class="plot" id="token-plot"></div>
+    </div>
+    <div class="card">
+      <h2>Models</h2>
+      <p class="fine">Estimated cost per model.</p>
+      <div class="legend" id="model-legend"></div>
+      <div class="plot" id="model-plot"></div>
+    </div>
+    <div class="card">
+      <h2>Machines</h2>
+      <p class="fine">Estimated cost per machine. Hover a bar for calls and tokens.</p>
+      <div class="plot" id="machine-plot"></div>
+    </div>
+    <div class="card">
+      <h2>Clients</h2>
+      <p class="fine">Estimated cost per Claude Code entrypoint.</p>
+      <div class="plot" id="client-plot"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Repositories</h2>
+    <p class="fine">Estimated cost per repository, guessed from the project paths. Imported history has no path and is left out.</p>
+    <div class="legend" id="repo-legend"></div>
+    <div class="plot" id="repo-plot"></div>
+  </section>
+
+  <section class="card">
+    <h2>Time of week</h2>
+    <p class="fine" id="hour-note"></p>
+    <div class="plot" id="hour-plot"></div>
+  </section>
+
+  <section class="card">
+    <h2>All models</h2>
+    <div class="table-wrap">
+      <table id="model-table">
+        <thead><tr><th>Model</th><th>API calls</th><th class="narrow-hide">Tokens</th><th>Est. cost</th><th>Share of cost</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Sources</h2>
+    <ul class="notes" id="notes"></ul>
+  </section>
+</main>
+
+<script type="application/json" id="report-data">/*REPORT_DATA*/null</script>
+<script>
+(() => {
+  const data = JSON.parse(document.getElementById('report-data').textContent);
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const FAMILIES = ['opus', 'fable', 'sonnet', 'haiku'];
+  const FAMILY_NAMES = { opus: 'Opus', fable: 'Fable', sonnet: 'Sonnet', haiku: 'Haiku', mythos: 'Mythos' };
+  const CLIENT_NAMES = { 'sdk-ts': 'T3 Code (sdk-ts)', 'claude-desktop': 'Desktop app', cli: 'Terminal (cli)', 'sdk-cli': 'Headless (sdk-cli)', 'stats-cache': 'Imported history' };
+  const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  let split = 'machine';
+
+  // ---- formatting -------------------------------------------------------
+  const compact = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+  const whole = new Intl.NumberFormat('en');
+  const usd = (v) => '$' + new Intl.NumberFormat('en', { minimumFractionDigits: Math.abs(v) >= 100 ? 0 : 2, maximumFractionDigits: Math.abs(v) >= 100 ? 0 : 2 }).format(v);
+  const usdTick = (v) => (v >= 1000 ? '$' + compact.format(v) : '$' + whole.format(v));
+  const pct = (v) => (v > 0 && v < 0.001 ? '<0.1%' : (v * 100).toFixed(1) + '%');
+  const parseDay = (day) => new Date(day + 'T00:00:00Z');
+  const dayLabel = (day) => parseDay(day).toLocaleDateString('en', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  const monthLabel = (day) => parseDay(day).toLocaleDateString('en', { month: 'short', timeZone: 'UTC' });
+  const sum = (xs, f) => xs.reduce((s, x) => s + f(x), 0);
+
+  // ---- colors: they follow the entity, assigned in a fixed order ---------
+  const slot = (i) => (i >= 0 && i < 8 ? `var(--s${i + 1})` : 'var(--other)');
+  const machineColor = (m) => slot(data.machine_order.indexOf(m));
+  const familyColor = (f) => (FAMILIES.includes(f) ? slot(4 + FAMILIES.indexOf(f)) : 'var(--other)');
+  const familyName = (f) => FAMILY_NAMES[f] ?? f;
+
+  // ---- DOM and SVG helpers ----------------------------------------------
+  const el = (tag, attrs = {}, text) => {
+    const node = document.createElement(tag);
+    Object.entries(attrs).forEach(([k, v]) => node.setAttribute(k, v));
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const svgEl = (tag, attrs = {}, text) => {
+    const node = document.createElementNS(SVG_NS, tag);
+    Object.entries(attrs).forEach(([k, v]) => node.setAttribute(k, v));
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+  const measurer = svgEl('svg', { width: 0, height: 0, style: 'position:absolute;visibility:hidden' });
+  document.body.append(measurer);
+  const textWidth = (strings, cls) => strings.reduce((w, s) => {
+    const t = svgEl('text', cls ? { class: cls } : {}, s);
+    measurer.append(t);
+    const width = t.getComputedTextLength();
+    t.remove();
+    return Math.max(w, width);
+  }, 0);
+  const plotFor = (id) => {
+    const plot = document.getElementById(id);
+    plot.replaceChildren();
+    return plot;
+  };
+  const newSvg = (plot, width, height) => {
+    const svg = svgEl('svg', { viewBox: `0 0 ${width} ${height}`, role: 'img' });
+    plot.append(svg);
+    return svg;
+  };
+  const roundedTop = (x, y, w, h, r) => {
+    const rr = Math.min(r, w / 2, h);
+    return `M${x},${y + h}V${y + rr}Q${x},${y} ${x + rr},${y}H${x + w - rr}Q${x + w},${y} ${x + w},${y + rr}V${y + h}Z`;
+  };
+  const roundedRight = (x, y, w, h, r) => {
+    const rr = Math.min(r, h / 2, w);
+    return `M${x},${y}H${x + w - rr}Q${x + w},${y} ${x + w},${y + rr}V${y + h - rr}Q${x + w},${y + h} ${x + w - rr},${y + h}H${x}Z`;
+  };
+  const square = (x, y, w, h) => `M${x},${y}h${w}v${h}h${-w}Z`;
+  const legend = (id, items) => {
+    document.getElementById(id).replaceChildren(...items.map(([name, color]) => {
+      const item = el('span');
+      const sw = el('span', { class: 'swatch' });
+      sw.style.background = color;
+      item.append(sw, el('span', {}, name));
+      return item;
+    }));
+  };
+  const niceTicks = (max, count) => {
+    if (max <= 0) return [0];
+    const raw = max / count;
+    const mag = 10 ** Math.floor(Math.log10(raw));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw);
+    const top = Math.ceil(max / step) * step;
+    return Array.from({ length: Math.round(top / step) + 1 }, (_, i) => +(i * step).toFixed(10));
+  };
+
+  const tooltip = (plot) => {
+    const tip = el('div', { class: 'tip' });
+    tip.hidden = true;
+    plot.append(tip);
+    const show = (event, head, lines) => {
+      tip.replaceChildren(el('div', { class: 'head' }, head), ...lines.map(([color, name, value]) => {
+        const row = el('div', { class: 'row' });
+        if (color) {
+          const sw = el('span', { class: 'swatch' });
+          sw.style.background = color;
+          row.append(sw);
+        }
+        row.append(el('span', {}, name), el('b', {}, value));
+        return row;
+      }));
+      tip.hidden = false;
+      const box = plot.getBoundingClientRect();
+      const x = event.clientX - box.left;
+      const y = event.clientY - box.top;
+      const left = x + 14 + tip.offsetWidth > box.width ? Math.max(0, x - 14 - tip.offsetWidth) : x + 14;
+      const top = Math.min(Math.max(0, y - tip.offsetHeight / 2), Math.max(0, box.height - tip.offsetHeight));
+      tip.style.transform = `translate(${left}px, ${top}px)`;
+    };
+    return { show, hide: () => { tip.hidden = true; } };
+  };
+  const hover = (target, tip, head, lines) => {
+    target.addEventListener('pointermove', (event) => tip.show(event, head, lines));
+    target.addEventListener('pointerleave', tip.hide);
+  };
+  const emptyNote = (plot, text) => plot.append(el('p', { class: 'empty' }, text));
+
+  // ---- header -------------------------------------------------------------
+  const drawHeader = () => {
+    const t = data.totals;
+    document.getElementById('period').textContent = `${data.period} · ${data.machines_read} machine${data.machines_read === 1 ? '' : 's'} · generated ${new Date(data.generated_at).toLocaleString('en', { dateStyle: 'medium', timeStyle: 'short' })}`;
+    const alerts = document.getElementById('alerts');
+    alerts.replaceChildren(...data.failed.map((name) => {
+      const box = el('p', { class: 'alert', role: 'status' });
+      box.append(el('strong', {}, '⚠ Failed'), el('span', {}, `${name} could not be read, so these totals are incomplete. See Sources at the bottom.`));
+      return box;
+    }));
+    const recent = data.recent;
+    const change = recent && recent.previous > 0 ? recent.cost / recent.previous - 1 : null;
+    const tiles = [
+      ['Estimated cost', usd(t.cost), `${whole.format(t.days_with_usage)} days with usage`],
+      recent
+        ? [`Last ${recent.days} days`, usd(recent.cost), change === null ? `nothing in the ${recent.days} days before` : `${change > 0 ? '+' : ''}${(change * 100).toFixed(0)}% vs the ${recent.days} days before`]
+        : ['Per day with usage', usd(t.days_with_usage ? t.cost / t.days_with_usage : 0), 'average over the period'],
+      ['Tokens', compact.format(t.tokens), `${compact.format(sum(data.token_types.filter((x) => x.key === 'o'), (x) => x.tokens))} of them output`],
+      ['API calls', whole.format(t.calls), t.imported_rows ? 'imported history has no call counts' : 'one per API response'],
+    ];
+    document.getElementById('tiles').replaceChildren(...tiles.map(([label, value, detail]) => {
+      const tile = el('div', { class: 'tile' });
+      tile.append(el('span', { class: 'label' }, label), el('span', { class: 'value' }, value), el('span', { class: 'detail' }, detail));
+      return tile;
+    }));
+    document.getElementById('notes').replaceChildren(...data.notes.map((line) => el('li', {}, line)));
+  };
+
+  // ---- cost over time: stacked columns ------------------------------------
+  const drawTime = () => {
+    document.querySelectorAll('[data-split]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.split === split)));
+    const perWeek = data.bucket === 'week';
+    document.getElementById('time-title').textContent = perWeek ? 'Estimated cost per week' : 'Estimated cost per day';
+    const imported = data.buckets.some((b) => b.imported);
+    const gaps = data.buckets.some((b) => b.empty);
+    document.getElementById('time-note').textContent = [
+      perWeek ? 'Weeks start on Monday.' : '',
+      imported ? `Shaded "Imported" ${perWeek ? 'weeks' : 'days'} hold only history imported from Claude's stats cache: tokens per model and day, no call counts.` : '',
+      gaps ? `"No records" marks ${perWeek ? 'weeks' : 'days'} with nothing in the data.` : '',
+    ].filter(Boolean).join(' ');
+    const plot = plotFor('time-plot');
+    const cells = data.series[split];
+    const colorOf = split === 'machine' ? machineColor : familyColor;
+    const nameOf = split === 'machine' ? (k) => k : familyName;
+    const order = split === 'machine'
+      ? data.machine_order
+      : [...FAMILIES, ...[...new Set(cells.map((c) => c.key))].filter((k) => !FAMILIES.includes(k)).sort()];
+    const keys = order.filter((k) => cells.some((c) => c.key === k));
+    legend('time-legend', keys.map((k) => [nameOf(k), colorOf(k)]));
+    if (!data.buckets.length) { emptyNote(plot, 'No usage in this period.'); return; }
+
+    const today = data.generated_at.slice(0, 10);
+    const holdsToday = (b) => (perWeek ? b.start <= today && today < new Date(parseDay(b.start).getTime() + 7 * 864e5).toISOString().slice(0, 10) : b.start === today);
+    const byBucket = new Map(data.buckets.map((b) => [b.start, cells.filter((c) => c.bucket === b.start)]));
+    const totalOf = (b) => sum(byBucket.get(b.start), (c) => c.cost);
+    const width = Math.max(320, plot.clientWidth);
+    const height = 300;
+    const top = 26;
+    const bottom = height - 24;
+    const ticks = niceTicks(Math.max(...data.buckets.map(totalOf), 0), 5);
+    const yMax = ticks[ticks.length - 1] || 1;
+    const y = (v) => bottom - (v / yMax) * (bottom - top);
+    const left = textWidth(ticks.map(usdTick), 'num') + 10;
+    const n = data.buckets.length;
+    const step = (width - left - 4) / n;
+    const barW = Math.max(1, Math.min(28, step * 0.75));
+    const xOf = (i) => left + i * step + (step - barW) / 2;
+    const svg = newSvg(plot, width, height);
+
+    // shaded runs for imported buckets and buckets without records
+    const kindOf = (b) => (b.empty ? 'none' : b.imported ? 'imported' : 'real');
+    const runs = data.buckets.reduce((acc, b, i) => {
+      const kind = kindOf(b);
+      const last = acc[acc.length - 1];
+      return last && last.kind === kind && last.to === i - 1 ? [...acc.slice(0, -1), { ...last, to: i }] : [...acc, { kind, from: i, to: i }];
+    }, []).filter((r) => r.kind !== 'real');
+    runs.forEach((r) => {
+      const x0 = left + r.from * step;
+      const x1 = left + (r.to + 1) * step;
+      svg.append(svgEl('rect', { x: x0, y: top - 20, width: x1 - x0, height: bottom - top + 20, rx: 4, fill: 'var(--line)', 'fill-opacity': r.kind === 'none' ? 0.45 : 0.8 }));
+      const label = r.kind === 'none' ? 'No records' : 'Imported';
+      if (textWidth([label]) + 8 < x1 - x0) svg.append(svgEl('text', { x: (x0 + x1) / 2, y: top - 6, 'text-anchor': 'middle' }, label));
+    });
+
+    ticks.forEach((t) => {
+      svg.append(svgEl('line', { x1: left, x2: width - 4, y1: y(t), y2: y(t), stroke: t === 0 ? 'var(--axis)' : 'var(--line)', 'stroke-width': 1 }));
+      svg.append(svgEl('text', { class: 'num', x: left - 8, y: y(t), dy: '0.32em', 'text-anchor': 'end' }, usdTick(t)));
+    });
+
+    const tip = tooltip(plot);
+    data.buckets.forEach((b, i) => {
+      const parts = keys.map((k) => ({ k, v: sum(byBucket.get(b.start).filter((c) => c.key === k), (c) => c.cost) })).filter((p) => p.v > 0);
+      const stacked = parts.reduce((acc, p) => [...acc, { ...p, y0: acc.length ? acc[acc.length - 1].y1 : 0, y1: (acc.length ? acc[acc.length - 1].y1 : 0) + p.v }], []);
+      stacked.forEach((p, j) => {
+        const yTop = y(p.y1);
+        const h = y(p.y0) - (j > 0 ? 2 : 0) - yTop;
+        if (h <= 0) return;
+        svg.append(svgEl('path', { d: j === stacked.length - 1 ? roundedTop(xOf(i), yTop, barW, h, 4) : square(xOf(i), yTop, barW, h), fill: colorOf(p.k) }));
+      });
+      const head = (perWeek ? 'Week of ' : '') + dayLabel(b.start) + (holdsToday(b) ? ' (so far)' : '') + (b.imported ? ' · imported' : '');
+      const lines = b.empty ? [[null, 'No records', '']] : [...stacked.slice().reverse().map((p) => [colorOf(p.k), nameOf(p.k), usd(p.v)]), [null, 'Total', usd(totalOf(b))]];
+      const hit = svgEl('rect', { x: left + i * step, y: top - 20, width: step, height: bottom - top + 20, fill: 'transparent' });
+      svg.append(hit);
+      hover(hit, tip, head, lines);
+    });
+
+    // x labels: per week the first bucket of each month, per day every Monday; skipped where they would collide
+    const labelled = data.buckets.map((b, i) => ({ b, i })).filter(({ b, i }) => (perWeek
+      ? i === 0 || b.start.slice(0, 7) !== data.buckets[i - 1].start.slice(0, 7)
+      : i === 0 || parseDay(b.start).getUTCDay() === 1));
+    const labelW = textWidth(['May 31']) + 8;
+    labelled.reduce((lastX, { b, i }) => {
+      const x = left + i * step + step / 2;
+      if (x - lastX < labelW) return lastX;
+      svg.append(svgEl('text', { x, y: height - 6, 'text-anchor': 'middle' }, perWeek ? monthLabel(b.start) : dayLabel(b.start)));
+      return x;
+    }, -Infinity);
+  };
+
+  // ---- horizontal bars --------------------------------------------------------
+  const drawBars = (id, rows, { label, color, lines }) => {
+    const plot = plotFor(id);
+    if (!rows.length) { emptyNote(plot, 'Nothing in this period.'); return; }
+    const width = Math.max(300, plot.clientWidth);
+    const rowH = 30;
+    const height = rows.length * rowH + 2;
+    const svg = newSvg(plot, width, height);
+    const left = textWidth(rows.map(label)) + 12;
+    const right = textWidth(rows.map((r) => usd(r.cost)), 'value') + 10;
+    const max = Math.max(...rows.map((r) => r.cost), 0) || 1;
+    const scale = (v) => (v / max) * Math.max(10, width - left - right);
+    const tip = tooltip(plot);
+    rows.forEach((r, i) => {
+      const y0 = i * rowH;
+      const w = Math.max(1, scale(r.cost));
+      svg.append(svgEl('text', { x: 0, y: y0 + rowH / 2, dy: '0.32em' }, label(r)));
+      svg.append(svgEl('path', { d: roundedRight(left, y0 + 6, w, rowH - 12, 4), fill: color(r) }));
+      svg.append(svgEl('text', { class: 'value', x: left + w + 6, y: y0 + rowH / 2, dy: '0.32em' }, usd(r.cost)));
+      const hit = svgEl('rect', { x: 0, y: y0, width, height: rowH, fill: 'transparent' });
+      svg.append(hit);
+      hover(hit, tip, label(r), lines(r));
+    });
+    svg.append(svgEl('line', { x1: left, x2: left, y1: 0, y2: height, stroke: 'var(--axis)' }));
+  };
+  const usageLines = (r) => [[null, 'Est. cost', `${usd(r.cost)} · ${pct(data.totals.cost ? r.cost / data.totals.cost : 0)}`], [null, 'API calls', whole.format(r.calls)], [null, 'Tokens', compact.format(r.tokens)]];
+
+  // ---- token types: share of tokens vs share of cost -----------------------
+  const drawTokens = () => {
+    legend('token-legend', [['Share of tokens', 'var(--track)'], ['Share of cost', 'var(--accent)']]);
+    const plot = plotFor('token-plot');
+    const rows = data.token_types;
+    const tokens = sum(rows, (r) => r.tokens);
+    const cost = sum(rows, (r) => r.cost);
+    if (!tokens) { emptyNote(plot, 'Nothing in this period.'); return; }
+    const width = Math.max(300, plot.clientWidth);
+    const groupH = 52;
+    const height = rows.length * groupH;
+    const svg = newSvg(plot, width, height);
+    const left = textWidth(rows.map((r) => r.label)) + 12;
+    const right = textWidth(['100.0%'], 'value') + 10;
+    const scale = (v) => v * Math.max(10, width - left - right);
+    const tip = tooltip(plot);
+    rows.forEach((r, i) => {
+      const y0 = i * groupH + 6;
+      const shares = [[tokens ? r.tokens / tokens : 0, 'var(--track)', 0], [cost ? r.cost / cost : 0, 'var(--accent)', 20]];
+      svg.append(svgEl('text', { x: 0, y: y0 + 19, dy: '0.32em' }, r.label));
+      shares.forEach(([share, fill, off]) => {
+        const w = Math.max(1, scale(share));
+        svg.append(svgEl('path', { d: roundedRight(left, y0 + off, w, 18, 4), fill }));
+        svg.append(svgEl('text', { class: 'value', x: left + w + 6, y: y0 + off + 9, dy: '0.32em' }, pct(share)));
+      });
+      const hit = svgEl('rect', { x: 0, y: i * groupH, width, height: groupH, fill: 'transparent' });
+      svg.append(hit);
+      hover(hit, tip, r.label, [['var(--track)', 'Tokens', `${compact.format(r.tokens)} · ${pct(shares[0][0])}`], ['var(--accent)', 'Est. cost', `${usd(r.cost)} · ${pct(shares[1][0])}`]]);
+    });
+    svg.append(svgEl('line', { x1: left, x2: left, y1: 0, y2: height, stroke: 'var(--axis)' }));
+  };
+
+  // ---- repositories: bars stacked by machine ---------------------------------
+  const drawRepos = () => {
+    const plot = plotFor('repo-plot');
+    const rows = data.repos.slice(0, 15);
+    const machines = data.machine_order.filter((m) => rows.some((r) => r.machines[m]));
+    legend('repo-legend', machines.map((m) => [m, machineColor(m)]));
+    if (!rows.length) { emptyNote(plot, 'No transcripts with a project path in this period.'); return; }
+    const width = Math.max(300, plot.clientWidth);
+    const rowH = 30;
+    const height = rows.length * rowH + 2;
+    const svg = newSvg(plot, width, height);
+    const left = textWidth(rows.map((r) => r.name)) + 12;
+    const right = textWidth(rows.map((r) => usd(r.cost)), 'value') + 10;
+    const max = Math.max(...rows.map((r) => r.cost), 0) || 1;
+    const scale = (v) => (v / max) * Math.max(10, width - left - right);
+    const total = sum(data.repos, (r) => r.cost);
+    const tip = tooltip(plot);
+    rows.forEach((r, i) => {
+      const y0 = i * rowH;
+      svg.append(svgEl('text', { x: 0, y: y0 + rowH / 2, dy: '0.32em' }, r.name));
+      const parts = machines.filter((m) => r.machines[m] > 0).map((m) => ({ m, v: r.machines[m] }));
+      const placed = parts.reduce((acc, p) => [...acc, { ...p, x0: acc.length ? acc[acc.length - 1].x1 : 0, x1: (acc.length ? acc[acc.length - 1].x1 : 0) + p.v }], []);
+      placed.forEach((p, j) => {
+        const x0 = left + scale(p.x0) + (j > 0 ? 2 : 0);
+        const w = Math.max(1, left + scale(p.x1) - x0);
+        svg.append(svgEl('path', { d: j === placed.length - 1 ? roundedRight(x0, y0 + 6, w, rowH - 12, 4) : square(x0, y0 + 6, w, rowH - 12), fill: machineColor(p.m) }));
+      });
+      svg.append(svgEl('text', { class: 'value', x: left + scale(r.cost) + 6, y: y0 + rowH / 2, dy: '0.32em' }, usd(r.cost)));
+      const hit = svgEl('rect', { x: 0, y: y0, width, height: rowH, fill: 'transparent' });
+      svg.append(hit);
+      hover(hit, tip, `${r.name} · ${pct(total ? r.cost / total : 0)} of repository cost`, [...parts.map((p) => [machineColor(p.m), p.m, usd(p.v)]), [null, 'API calls', whole.format(r.calls)]]);
+    });
+    svg.append(svgEl('line', { x1: left, x2: left, y1: 0, y2: height, stroke: 'var(--axis)' }));
+    if (data.repos.length > rows.length) plot.append(el('p', { class: 'fine' }, `${data.repos.length - rows.length} smaller ones not shown: ${usd(sum(data.repos.slice(rows.length), (r) => r.cost))} together.`));
+  };
+
+  // ---- weekday x hour heatmap ------------------------------------------------
+  const drawHours = () => {
+    document.getElementById('hour-note').textContent = `Estimated cost per weekday and hour in ${data.timezone}, the timezone of the machine that wrote this report. The stronger a cell's color, the more it cost.${data.totals.imported_rows ? ' Imported history has no time of day and is left out.' : ''}`;
+    const plot = plotFor('hour-plot');
+    if (!data.hours.length) { emptyNote(plot, 'No transcripts with a time in this period.'); return; }
+    const cell = new Map(data.hours.map((h) => [`${h.weekday}-${h.hour}`, h]));
+    const max = Math.max(...data.hours.map((h) => h.cost), 0) || 1;
+    const width = Math.max(320, plot.clientWidth);
+    const left = textWidth(WEEKDAYS) + 10;
+    const cw = (width - left) / 24;
+    const ch = Math.min(26, Math.max(16, cw));
+    const height = 7 * ch + 22;
+    const svg = newSvg(plot, width, height);
+    const tip = tooltip(plot);
+    WEEKDAYS.forEach((name, d) => {
+      svg.append(svgEl('text', { x: 0, y: d * ch + ch / 2, dy: '0.32em' }, name));
+      Array.from({ length: 24 }, (_, h) => h).forEach((h) => {
+        const c = cell.get(`${d + 1}-${h}`);
+        const v = c ? c.cost : 0;
+        const rect = svgEl('rect', {
+          x: left + h * cw + 1, y: d * ch + 1, width: Math.max(1, cw - 2), height: ch - 2, rx: 3,
+          fill: v > 0 ? 'var(--accent)' : 'var(--line)', 'fill-opacity': v > 0 ? 0.12 + 0.88 * Math.sqrt(v / max) : 0.6,
+        });
+        svg.append(rect);
+        const hh = (x) => String(x % 24).padStart(2, '0') + ':00';
+        hover(rect, tip, `${name} ${hh(h)}–${hh(h + 1)}`, [[null, 'Est. cost', usd(v)], [null, 'API calls', whole.format(c ? c.calls : 0)]]);
+      });
+    });
+    const hourTicks = cw < 22 ? [0, 6, 12, 18] : [0, 3, 6, 9, 12, 15, 18, 21];
+    hourTicks.forEach((h) => svg.append(svgEl('text', { x: left + h * cw + 1, y: 7 * ch + 15 }, String(h).padStart(2, '0') + ':00')));
+  };
+
+  const drawModelTable = () => {
+    document.querySelector('#model-table tbody').replaceChildren(...data.models.map((m) => {
+      const tr = el('tr');
+      [[m.name], [whole.format(m.calls)], [compact.format(m.tokens), 'narrow-hide'], [usd(m.cost)], [pct(data.totals.cost ? m.cost / data.totals.cost : 0)]]
+        .forEach(([text, cls]) => tr.append(el('td', cls ? { class: cls } : {}, text)));
+      return tr;
+    }));
+  };
+
+  const drawAll = () => {
+    drawHeader();
+    drawTime();
+    drawTokens();
+    const families = [...FAMILIES, ...new Set(data.models.map((m) => m.family))].filter((f, i, all) => all.indexOf(f) === i && data.models.some((m) => m.family === f));
+    legend('model-legend', families.map((f) => [familyName(f), familyColor(f)]));
+    drawBars('model-plot', data.models.slice(0, 12), { label: (r) => r.name.replace(/^claude-/, ''), color: (r) => familyColor(r.family), lines: usageLines });
+    drawBars('machine-plot', data.machines, { label: (r) => r.name, color: (r) => machineColor(r.name), lines: usageLines });
+    drawBars('client-plot', data.entrypoints, { label: (r) => CLIENT_NAMES[r.name] ?? r.name, color: () => 'var(--accent)', lines: usageLines });
+    drawRepos();
+    drawHours();
+    drawModelTable();
+  };
+
+  document.querySelectorAll('[data-split]').forEach((b) => b.addEventListener('click', () => { split = b.dataset.split; drawTime(); }));
+  let lastWidth = 0;
+  new ResizeObserver(() => {
+    const w = document.getElementById('report').clientWidth;
+    if (w !== lastWidth) { lastWidth = w; drawAll(); }
+  }).observe(document.getElementById('report'));
+})();
+</script>
+</body>
+</html>
