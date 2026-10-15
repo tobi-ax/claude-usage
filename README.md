@@ -74,11 +74,18 @@ The page is self-contained: the data sits in the file and the charts are
 drawn by plain JavaScript in it, with no network access, so it opens from
 disk and can be mailed around. It follows the browser's light or dark mode.
 
-It shows the totals, the estimated cost per day (per week for periods
-longer than 62 days) split by machine or by model family, token types by
-share of tokens and of cost, cost by model, machine, client and repository,
-a weekday-by-hour heatmap, and the header lines of the text report.
-`--last`, `--since` and `--until` apply as usual.
+It shows the totals, the estimated cost over time split by machine or by
+model family, token types by share of tokens and of cost, cost by model,
+machine, client and repository, a weekday-by-hour heatmap, and the header
+lines of the text report.
+
+The cost-over-time chart has one bar per day, week or month. By default it
+takes the finest of the three that keeps the bars at least 12 px apart at
+the current width, so a phone gets months where a wide screen gets days,
+and it picks again when the window is resized. The Day / Week / Month
+buttons override that choice; a size too fine for the width is greyed
+out. Past about 20 months on a phone even the monthly bars get closer than
+that. `--last`, `--since` and `--until` apply as usual.
 
 The page is built from `report.html`, which has to stay next to the
 script. The symlink install keeps it there, since the symlink resolves into

@@ -71,27 +71,20 @@ def test_token_type_costs_add_up_to_the_total(html_report, usage):
     assert [t["key"] for t in data["token_types"]] == list(cu.TOKEN_KEYS)
 
 
-def test_a_short_period_is_charted_per_day_with_gaps(html_report, usage, local_tz):
+def test_the_time_chart_gets_one_value_per_day_and_key(html_report, usage, local_tz):
     local_tz("UTC")
     _, _, _, data = html_report("--no-warehouse")
-    assert data["bucket"] == "day"
-    assert [(b["start"], b["empty"]) for b in data["buckets"]] == [
-        ("2026-09-01", False), ("2026-09-02", True), ("2026-09-03", False)]
-    assert {(c["bucket"], c["key"]) for c in data["series"]["family"]} == {
-        ("2026-09-01", "opus"), ("2026-09-03", "opus"), ("2026-09-03", "sonnet")}
+    assert data["days"] == [{"day": "2026-09-01", "imported": False}, {"day": "2026-09-03", "imported": False}]
+    assert {(c["day"], c["key"]): c["cost"] for c in data["series"]["family"]} == {
+        ("2026-09-01", "opus"): 26.0, ("2026-09-03", "opus"): 2.5, ("2026-09-03", "sonnet"): 14.0}
+    assert {(c["day"], c["key"]) for c in data["series"]["machine"]} == {
+        ("2026-09-01", platform.node()), ("2026-09-03", platform.node())}
 
 
-def test_a_long_period_is_charted_per_week_from_monday(html_report, projects_dir, local_tz):
-    local_tz("UTC")
-    write_transcript(projects_dir, "-c-app/s1.jsonl", [
-        record(msg_id="m1", ts="2026-07-01T09:00:00.000Z"),  # a Wednesday
-        record(msg_id="m2", ts="2026-09-30T09:00:00.000Z"),
-    ])
-    _, _, _, data = html_report("--no-warehouse")
-    assert data["bucket"] == "week"
-    assert data["buckets"][0]["start"] == "2026-06-29"
-    assert data["buckets"][-1]["start"] == "2026-09-28"
-    assert len(data["buckets"]) == 14
+def test_days_use_local_time(html_report, projects_dir, local_tz):
+    local_tz("Europe/Berlin")
+    write_transcript(projects_dir, "-c-app/s1.jsonl", [record(msg_id="m1", ts="2026-09-13T22:30:00.000Z")])
+    assert [d["day"] for d in html_report("--no-warehouse")[3]["days"]] == ["2026-09-14"]
 
 
 def test_repos_and_hours_leave_out_imported_history(html_report, usage, warehouse_path, local_tz):
@@ -106,7 +99,7 @@ def test_repos_and_hours_leave_out_imported_history(html_report, usage, warehous
     assert sorted(r["name"] for r in data["repos"]) == ["app", "tool"]
     assert sum(h["calls"] for h in data["hours"]) == 3
     assert {(h["weekday"], h["hour"]) for h in data["hours"]} == {(2, 9), (4, 15), (4, 16)}
-    assert data["buckets"][0] == {"start": "2026-08-20", "empty": False, "imported": True}
+    assert data["days"][0] == {"day": "2026-08-20", "imported": True}
     assert "box" in data["machine_order"]
 
 
@@ -155,7 +148,7 @@ def test_the_page_names_failed_machines(html_report, usage, write_config, fake_s
 
 def test_an_empty_report_still_renders(html_report):
     _, _, _, data = html_report("--no-warehouse")
-    assert data["buckets"] == [] and data["repos"] == [] and data["totals"]["first_day"] is None
+    assert data["days"] == [] and data["repos"] == [] and data["totals"]["first_day"] is None
 
 
 def test_a_missing_template_stops(run, config_path, projects_dir, tmp_path, monkeypatch):
@@ -177,3 +170,13 @@ def test_a_template_without_the_marker_stops(run, config_path, projects_dir, tmp
 def test_the_shipped_template_holds_the_marker_once():
     with open(cu.html_template_path(), encoding="utf-8") as fh:
         assert fh.read().count(cu.HTML_DATA_MARKER) == 1
+
+
+def test_a_day_with_real_rows_is_not_imported(html_report, usage, warehouse_path, local_tz):
+    local_tz("UTC")
+    imported = {"id": "stats-cache:box:2026-09-01:claude-opus-5", "rq": "", "t": "2026-09-01T12:00:00.000Z",
+                "m": "claude-opus-5", "i": 0, "o": 1000, "w5": 0, "w1": 0, "r": 0, "f": 0,
+                "e": cu.IMPORTED_ENTRYPOINT, "s": "", "p": "", "n": 0, "mach": "box"}
+    warehouse_path.parent.mkdir(parents=True)
+    warehouse_path.write_text(json.dumps(imported) + "\n")
+    assert html_report()[3]["days"][0] == {"day": "2026-09-01", "imported": False}
