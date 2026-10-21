@@ -1186,6 +1186,24 @@ def machine_lines(machines):
     return [line(m) for m in machines]
 
 
+def warehouse_only_machines(rows, machines):
+    """Machines with rows in the warehouse that this run did not read, such as a host
+    removed from the config after its last scan. Their rows still count."""
+    read = {m["name"] for m in machines}
+    names = sorted({r["mach"] for r in rows} - read)
+    return [{"name": n, "calls": sum(r.get("n", 1) for r in rows if r["mach"] == n),
+             "last_day": max(r["t"][:10] for r in rows if r["mach"] == n)} for n in names]
+
+
+def warehouse_only_lines(entries):
+    return ["  {:<14} {:>6,} API calls  warehouse only, not read this run, latest {}".format(
+        e["name"], e["calls"], e["last_day"]) for e in entries]
+
+
+def machine_count(ctx):
+    return len(ctx["machines"]) + len(ctx["warehouse_only"])
+
+
 def warehouse_line(info):
     if info is None:
         return "  Warehouse: not used (--no-warehouse)"
@@ -1249,11 +1267,12 @@ def render_report(ctx):
     machines, selected, pricing, args = ctx["machines"], ctx["selected"], ctx["pricing"], ctx["args"]
     grand = summarize(selected, pricing)
     unpriced_models = sorted({r["m"] for r in selected if price_key(r["m"], pricing) is None})
+    count = machine_count(ctx)
     out = ["Claude Code usage  ·  {}  ·  {} machine{}".format(
-        period_text(selected, ctx["since"], ctx["until"]), len(machines), "" if len(machines) == 1 else "s")]
+        period_text(selected, ctx["since"], ctx["until"]), count, "" if count == 1 else "s")]
     if not ctx["setup_done"]:
         out.append("  No config yet: run 'claude-usage setup' to add SSH hosts and fetch current prices.")
-    out += machine_lines(machines)
+    out += machine_lines(machines) + warehouse_only_lines(ctx["warehouse_only"])
     out.append(warehouse_line(ctx["warehouse"]))
     out.append(pricing_source_line(ctx["fetched_pricing"], ctx["pricing_overrides"], ctx["pricing_builtin_only"]))
     if ctx["cross_dupes"]:
@@ -1305,6 +1324,7 @@ def render_json(ctx):
         "setup_done": ctx["setup_done"],
         "machines": [{"name": m["name"], "calls": len(m["rows"]), "error": m["error"],
                       **{k: m["meta"].get(k) for k in ("files", "seconds", "node", "projects_dir", "python")}} for m in machines],
+        "warehouse_only_machines": ctx["warehouse_only"],
         "warehouse": ctx["warehouse"],
         "pricing": pricing_source_json(ctx["fetched_pricing"], ctx["pricing_overrides"], ctx["pricing_builtin_only"]),
         "cross_machine_duplicates": ctx["cross_dupes"],
@@ -1367,7 +1387,7 @@ def header_notes(ctx):
     """The text report's header lines, for the page's notes."""
     selected, pricing = ctx["selected"], ctx["pricing"]
     unpriced = sorted({r["m"] for r in selected if price_key(r["m"], pricing) is None})
-    lines = (machine_lines(ctx["machines"])
+    lines = (machine_lines(ctx["machines"]) + warehouse_only_lines(ctx["warehouse_only"])
              + [warehouse_line(ctx["warehouse"]),
                 pricing_source_line(ctx["fetched_pricing"], ctx["pricing_overrides"], ctx["pricing_builtin_only"])]
              + (["{:,} responses were present on more than one machine and are counted once.".format(ctx["cross_dupes"])]
@@ -1411,7 +1431,7 @@ def html_data(ctx):
         "period": period_text(selected, ctx["since"], ctx["until"]),
         "timezone": datetime.now().astimezone().strftime("%Z (UTC%z)"),
         "notes": header_notes(ctx),
-        "machines_read": len(ctx["machines"]),
+        "machine_count": machine_count(ctx),
         "failed": [m["name"] for m in ctx["machines"] if m["error"]],
         "setup_done": ctx["setup_done"],
         "totals": {"cost": round(grand["cost"], 4), "calls": grand["calls"], "tokens": total_tokens(grand),
@@ -1567,6 +1587,7 @@ def main(argv):
         "machines": machines, "pricing": pricing, "args": args, "since": since, "until": until,
         "selected": [r for r in rows if in_period(r, since_s, until_s)],
         "cross_dupes": len(all_rows) - len(live), "warehouse": warehouse,
+        "warehouse_only": warehouse_only_machines(rows, machines),
         "fetched_pricing": fetched_pricing, "pricing_overrides": pricing_overrides,
         "pricing_builtin_only": pricing_builtin_only, "setup_done": setup_done,
     }

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from conftest import cu, record, write_transcript
 
 
@@ -75,3 +77,44 @@ def test_warehouse_path_comes_from_the_flag_then_the_config(report, projects_dir
     assert from_config.exists()
     report("--warehouse", str(from_flag))
     assert from_flag.exists()
+
+
+@pytest.fixture
+def retired_box(projects_dir, warehouse_path):
+    """This machine has one transcript; the warehouse also holds rows of a box no longer read."""
+    write_transcript(projects_dir, "a.jsonl", [record(msg_id="m1")])
+    cu.save_warehouse(str(warehouse_path), [
+        row("old1", t="2026-09-10T10:00:00.000Z", mach="retired-box"),
+        row("old2", t="2026-09-12T10:00:00.000Z", mach="retired-box"),
+        row("stats-cache:retired-box:2026-08-01:claude-opus-5", t="2026-08-01T12:00:00.000Z",
+            mach="retired-box", e=cu.IMPORTED_ENTRYPOINT, n=0),
+    ])
+
+
+def test_a_machine_only_in_the_warehouse_is_named_and_still_counted(report, retired_box):
+    code, doc, _ = report()
+    assert code == 0
+    assert doc["warehouse_only_machines"] == [{"name": "retired-box", "calls": 2, "last_day": "2026-09-12"}]
+    assert doc["by_machine"]["retired-box"]["calls"] == 2
+    assert doc["totals"]["calls"] == 3
+
+
+def test_the_text_header_lists_and_counts_warehouse_only_machines(run, config_path, projects_dir, retired_box):
+    _, out, _ = run("--config", str(config_path), "--projects-dir", str(projects_dir))
+    lines = out.splitlines()
+    assert lines[0].endswith("·  2 machines")
+    assert any(l.split() == ["retired-box", "2", "API", "calls", "warehouse", "only,", "not", "read", "this",
+                             "run,", "latest", "2026-09-12"] for l in lines)
+
+
+def test_machines_read_this_run_are_not_warehouse_only(report, projects_dir):
+    write_transcript(projects_dir, "a.jsonl", [record(msg_id="m1")])
+    report()
+    _, doc, _ = report()
+    assert doc["warehouse_only_machines"] == []
+
+
+def test_no_warehouse_has_no_warehouse_only_machines(report, retired_box):
+    _, doc, _ = report("--no-warehouse")
+    assert doc["warehouse_only_machines"] == []
+    assert "retired-box" not in doc["by_machine"]
