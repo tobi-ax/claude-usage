@@ -307,7 +307,7 @@
   // ---- header -------------------------------------------------------------
   const drawHeader = () => {
     const t = data.totals;
-    document.getElementById('period').textContent = `${data.period} · ${data.machines_read} machine${data.machines_read === 1 ? '' : 's'} · generated ${new Date(data.generated_at).toLocaleString('en', { dateStyle: 'medium', timeStyle: 'short' })}`;
+    document.getElementById('period').textContent = `${data.period} · ${data.machine_count} machine${data.machine_count === 1 ? '' : 's'} · generated ${new Date(data.generated_at).toLocaleString('en', { dateStyle: 'medium', timeStyle: 'short' })}`;
     const alerts = document.getElementById('alerts');
     alerts.replaceChildren(...data.failed.map((name) => {
       const box = el('p', { class: 'alert', role: 'status' });

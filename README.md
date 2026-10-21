@@ -185,6 +185,18 @@ Only the machine running the report has the warehouse. Remote machines are
 scanned live each time, so a remote machine that is gone for good still
 counts as long as this machine saw it before its transcripts expired.
 
+A machine that has rows in the warehouse but was not read in this run, such
+as a host removed from the config or one left out with `--host`,
+`--no-remote` or `--no-local`, gets a header line of its own with its API
+calls and the day of its latest response. Its usage still counts, the
+machine count in the header includes it, and `--json` lists it under
+`warehouse_only_machines`.
+
+To retire a machine, run `claude-usage` once more while it still answers, so
+the warehouse holds its usage up to that moment, then remove it with
+`claude-usage setup`. A deleted machine left in the config fails every run,
+and the report exits with 2.
+
 ### Daily snapshot with systemd
 
 ```

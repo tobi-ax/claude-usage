@@ -146,6 +146,18 @@ def test_the_page_names_failed_machines(html_report, usage, write_config, fake_s
     assert any(n.startswith("nope") and "FAILED" in n for n in data["notes"])
 
 
+def test_the_page_counts_and_notes_warehouse_only_machines(html_report, usage, warehouse_path):
+    warehouse_path.parent.mkdir(parents=True)
+    retired = {"id": "old1", "rq": "req", "t": "2026-08-20T10:00:00.000Z", "m": "claude-opus-5", "i": 0, "o": 1,
+               "w5": 0, "w1": 0, "r": 0, "f": 0, "e": "cli", "s": "", "p": "", "mach": "retired-box"}
+    warehouse_path.write_text(json.dumps(retired) + "\n")
+    code, _, _, data = html_report()
+    assert code == 0
+    assert data["machine_count"] == 2
+    assert data["failed"] == []
+    assert any(n.startswith("retired-box") and "warehouse only" in n for n in data["notes"])
+
+
 def test_an_empty_report_still_renders(html_report):
     _, _, _, data = html_report("--no-warehouse")
     assert data["days"] == [] and data["repos"] == [] and data["totals"]["first_day"] is None
